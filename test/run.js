@@ -148,7 +148,7 @@ async function untilReady(A, sid) { for (let i = 0; i < 200; i++) { const s = (a
       assert.strictEqual((await A('GET', `/api/sessions/${sid}/files/${h}`)).status, 200, 'cleanup keeps audio that versions use');
     } else console.log('ffmpeg not installed here: skipped the audio tests');
 
-    assert.strictEqual((await T('DELETE', '/api/sessions/' + sid)).status, 401, 'disabled user is signed out');
+    assert.strictEqual((await T('DELETE', '/api/sessions/' + sid)).status, hasFfmpeg ? 401 : 403, hasFfmpeg ? 'disabled user is signed out' : 'trainee cannot delete');
     r = await A('DELETE', '/api/sessions/' + sid); assert.strictEqual(r.status, 200);
     assert.strictEqual((await A('GET', '/api/sessions/' + sid)).status, 404);
     console.log('ok');
