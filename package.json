@@ -1,0 +1,15 @@
+{
+  "name": "livevault",
+  "version": "1.0.0",
+  "description": "Multitrack library for LiveWebMixer: host, organize and version multitrack sessions, keep mixes and Main LR recordings for review",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/run.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}

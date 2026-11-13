@@ -1,0 +1,28 @@
+# docker compose up -d
+# Then open https://<this machine's IP>:9543 and accept the certificate warning once.
+# The first visit asks you to create the admin account.
+# Everything LiveVault keeps is in the livevault-data volume.
+services:
+  livevault:
+    image: ghcr.io/leonidis2013/livevault:latest
+    build: .
+    container_name: livevault
+    restart: unless-stopped
+    ports:
+      - "9543:8443"
+      # plain http: LiveWebMixer downloads tracks through this port (and a reverse proxy can use it)
+      - "9580:8080"
+    volumes:
+      - livevault-data:/data
+      # optional watch folder: drop a folder of tracks (or a zip) here and it becomes a session.
+      # Point the left side at a shared folder you can reach from other computers.
+      # - /path/to/LiveVault Inbox:/watch
+    environment:
+      TZ: America/Chicago
+      # the host port mapped to 8080 above, so LiveVault can tell LiveWebMixer where to find it
+      HTTP_HOST_PORT: "9580"
+      # optional: largest single upload in MB
+      # MAX_UPLOAD_MB: "8192"
+
+volumes:
+  livevault-data:
