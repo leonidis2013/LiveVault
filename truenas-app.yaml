@@ -1,6 +1,6 @@
 # TrueNAS SCALE: Apps > Discover Apps > Custom App > "Install via YAML", paste this.
 # Then open https://<TrueNAS IP>:9543, accept the certificate warning once, and create the admin account.
-# Change the host ports if 9543 or 9580 are taken (keep HTTP_HOST_PORT the same as the http one).
+# Change the host ports if 9543 or 9580 are taken.
 # Data lives in a Docker named volume.
 services:
   livevault:
@@ -9,7 +9,7 @@ services:
     restart: unless-stopped
     ports:
       - "9543:8443"
-      # plain http: LiveWebMixer downloads tracks through this port
+      # plain http: LiveWebMixer reaches LiveVault through this port
       - "9580:8080"
     volumes:
       - livevault-data:/data
@@ -17,7 +17,6 @@ services:
       # - /mnt/tank/shares/LiveVault Inbox:/watch
     environment:
       TZ: America/Chicago
-      HTTP_HOST_PORT: "9580"
 
 volumes:
   livevault-data:

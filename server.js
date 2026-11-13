@@ -1,7 +1,7 @@
 // LiveVault server: multitrack library for LiveWebMixer.
 // Stores every track once (by content hash) as 96 kHz / 24-bit WAV, keeps sessions with
 // major.minor.patch versions, per-user permissions, license restrictions, saved mixes,
-// a watch folder, and hands sessions to LiveWebMixer with a short-lived ticket.
+// a watch folder, and the LiveVault API (version 1) that LiveWebMixer uses with personal access tokens.
 // No npm dependencies: Node built-ins plus the ffmpeg/unzip/openssl programs in the image.
 'use strict';
 const http = require('http');
@@ -28,7 +28,7 @@ const AUDIO_EXT = new Set(['.wav', '.wave', '.bwf', '.aif', '.aiff', '.flac', '.
 const PERMS = ['upload', 'edit', 'delete', 'download', 'mix', 'seeMixes', 'licensed'];
 const SOURCES = ['sq5', 'purchased', 'training', 'daw', 'other'];
 const KINDS = ['channel', 'reference', 'off'];
-const TICKET_DAYS = 7, LOGIN_DAYS = 30;
+const LOGIN_DAYS = 30;
 
 // ---------- small helpers ----------
 const id = (n = 4) => crypto.randomBytes(n).toString('hex');
@@ -84,34 +84,39 @@ function withJson(file, dflt, fn) {
 
 // ---------- settings ----------
 const SETTINGS_F = path.join(DATA, 'settings.json');
-const SETTINGS_DEFAULT = { lwmUrl: '', vaultUrl: '', keepOriginals: true, watchSource: 'sq5' };
+const SETTINGS_DEFAULT = { lwmUrl: '', keepOriginals: true, watchSource: 'sq5' };
 let settings = { ...SETTINGS_DEFAULT, ...(JSON.parse(fs.existsSync(SETTINGS_F) ? fs.readFileSync(SETTINGS_F, 'utf8') : '{}')) };
 
 // ---------- users and logins ----------
-const USERS_F = path.join(DATA, 'users.json'), LOGINS_F = path.join(DATA, 'logins.json'), TICKETS_F = path.join(DATA, 'tickets.json');
+const USERS_F = path.join(DATA, 'users.json'), LOGINS_F = path.join(DATA, 'logins.json');
 let users = (JSON.parse(fs.existsSync(USERS_F) ? fs.readFileSync(USERS_F, 'utf8') : '{"users":[]}')).users;
 let logins = JSON.parse(fs.existsSync(LOGINS_F) ? fs.readFileSync(LOGINS_F, 'utf8') : '{}');
-let tickets = JSON.parse(fs.existsSync(TICKETS_F) ? fs.readFileSync(TICKETS_F, 'utf8') : '{}');
 let saveChain = Promise.resolve();
 const persist = (f, v) => { saveChain = saveChain.then(() => writeJson(f, v)).catch(e => console.error('save', f, e.message)); return saveChain; };
 const saveUsers = () => persist(USERS_F, { users });
 const saveLogins = () => persist(LOGINS_F, logins);
-const saveTickets = () => persist(TICKETS_F, tickets);
 const hashPw = (pw, salt) => crypto.scryptSync(String(pw), salt, 64).toString('hex');
 const checkPw = (u, pw) => { const a = Buffer.from(hashPw(pw, u.salt), 'hex'), b = Buffer.from(u.hash, 'hex'); return a.length === b.length && crypto.timingSafeEqual(a, b); };
 const setPw = (u, pw) => { u.salt = id(16); u.hash = hashPw(pw, u.salt); };
 const pwProblem = pw => typeof pw !== 'string' || pw.length < 8 ? 'Passwords need at least 8 characters' : '';
 const normPerms = p => Object.fromEntries(PERMS.map(k => [k, !!(p && p[k])]));
 const can = (u, p) => !!u && (u.admin || !!(u.perms && u.perms[p]));
-const pubUser = u => ({ id: u.id, username: u.username, display: u.display, admin: !!u.admin, perms: normPerms(u.perms), disabled: !!u.disabled, created: u.created });
+const pubUser = u => ({ id: u.id, username: u.username, display: u.display, admin: !!u.admin, perms: normPerms(u.perms), disabled: !!u.disabled, created: u.created, tokens: (u.tokens || []).length });
 const userName = uid => uid === 'watch' ? 'Watch folder' : (users.find(u => u.id === uid) || {}).display || 'Removed user';
-// prune expired logins and tickets once an hour
+// prune expired logins once an hour
 setInterval(() => {
-  let a = false, b = false;
+  let a = false;
   for (const [k, l] of Object.entries(logins)) if (l.expires < now()) { delete logins[k]; a = true; }
-  for (const [k, t] of Object.entries(tickets)) if (t.expires < now()) { delete tickets[k]; b = true; }
-  if (a) saveLogins(); if (b) saveTickets();
+  if (a) saveLogins();
 }, 3600e3).unref();
+// Personal access tokens (for LiveWebMixer): shown once, stored only as a hash. They act as their owner, with the owner's permissions.
+function tokenUser(req) {
+  const m = /^Bearer (lv_[a-f0-9]{48})$/.exec(req.headers.authorization || ''); if (!m) return null;
+  const h = sha(m[1]);
+  for (const u of users) { const t = (u.tokens || []).find(t => t.sha === h); if (t) { if (u.disabled) return null; if (now() - (t.used || 0) > 3600e3) { t.used = now(); saveUsers(); } return u; } }
+  return null;
+}
+const pubToken = t => ({ id: t.id, name: t.name, created: t.created, used: t.used || null });
 
 function cookies(req) { const o = {}; for (const p of (req.headers.cookie || '').split(';')) { const i = p.indexOf('='); if (i > 0) o[p.slice(0, i).trim()] = decodeURIComponent(p.slice(i + 1).trim()); } return o; }
 function currentUser(req) {
@@ -450,7 +455,7 @@ async function saveMix(s, u, b, version) {
     const f = path.join(mixDir(s.id), b.mixId + '.json'), m = await readJson(f, null);
     if (m && m.by === u.id) { m.data = b.data; m.updated = now(); if (str(b.name, 80)) m.name = str(b.name, 80); m.version = version || m.version; await writeJson(f, m); delete m.data; return m; }
   }
-  const m = { id: id(4), sid: s.id, version: version || null, name: str(b.name, 80) || `${u.display}'s mix`, by: u.id, byName: u.display, created: now(), updated: now(), reference: false, data: b.data };
+  const m = { id: id(4), sid: s.id, version: version || null, name: str(b.name, 80) || `${u.display}'s mix`, by: u.id, byName: u.display, created: now(), updated: now(), reference: false, lwm: !!b.lwm, data: b.data };
   await writeJson(path.join(mixDir(s.id), m.id + '.json'), m); delete m.data; return m;
 }
 
@@ -478,19 +483,46 @@ async function addRecording(req, s, u, version, q) {
   } catch (e) { for (const x of ['.wav', '.wav.part', '.opus', '.peaks.json']) fsp.rm(path.join(dir, rid + x), { force: true }).catch(() => {}); throw e; }
 }
 
-// ---------- LiveWebMixer handoff ----------
-function vaultUrlFor(req) {
-  if (settings.vaultUrl) return settings.vaultUrl.replace(/\/+$/, '');
-  const host = (req.headers.host || 'localhost').replace(/:\d+$/, '');
-  return `http://${host}:${process.env.HTTP_HOST_PORT || PORT}`;
+// ---------- mixer copies: what LiveWebMixer plays (48 kHz FLAC, and Opus for remote use) ----------
+const MIXQ = { flac: { ext: '.flac', mime: 'audio/flac' }, hi: { ext: '.hi.opus', mime: 'audio/ogg', kbps: [96, 160] }, lo: { ext: '.lo.opus', mime: 'audio/ogg', kbps: [48, 80] } };
+const mixerPath = (h, q) => shard(path.join(DATA, 'mixer'), h, MIXQ[q].ext);
+const mixerJobs = new Map();
+function mixerCopies(h) {
+  if (mixerJobs.has(h)) return mixerJobs.get(h);
+  const job = (async () => {
+    if ((await Promise.all(Object.keys(MIXQ).map(q => exists(mixerPath(h, q))))).every(Boolean)) return;
+    const meta = await blobMeta(h), ch = meta && meta.channels > 1 ? 2 : 1, tmp = [], args = ['-y', '-v', 'error', '-i', blobPath(h)];
+    await fsp.mkdir(path.dirname(mixerPath(h, 'flac')), { recursive: true });
+    for (const [q, Q] of Object.entries(MIXQ)) {
+      const t = mixerPath(h, q) + '.' + id() + '.tmp'; tmp.push([t, mixerPath(h, q)]);
+      args.push('-map', '0:a:0', '-vn', '-ac', String(ch), '-ar', '48000');
+      if (Q.kbps) args.push('-c:a', 'libopus', '-b:a', Q.kbps[ch - 1] + 'k', '-vbr', 'on', '-application', 'audio', '-f', 'ogg'); else args.push('-c:a', 'flac', '-compression_level', '5', '-f', 'flac');
+      args.push(t);
+    }
+    try { await run('ffmpeg', args); for (const [a, b] of tmp) await fsp.rename(a, b); }
+    finally { for (const [a] of tmp) fsp.rm(a, { force: true }).catch(() => {}); }
+  })();
+  mixerJobs.set(h, job); job.finally(() => mixerJobs.delete(h)).catch(() => {});
+  return job;
 }
-function ticketUser(req) {
-  const m = /^Bearer ([a-f0-9]{48})$/.exec(req.headers.authorization || ''); if (!m) return null;
-  const t = tickets[sha(m[1])]; if (!t || t.expires < now()) return null;
-  const u = users.find(u => u.id === t.uid); if (!u || u.disabled || !can(u, 'mix')) return null;
-  const s = sessions.get(t.sid); if (!visible(u, s)) return null;
-  const v = findVersion(s, t.version); if (!v || v.v === 'draft') return null;
-  return { t, u, s, v };
+async function mixerSizes(h, ch, dur) {
+  const o = {};
+  for (const [q, Q] of Object.entries(MIXQ)) { const st = await fsp.stat(mixerPath(h, q)).catch(() => null); o[q] = st ? st.size : Math.round(Q.kbps ? Q.kbps[ch > 1 ? 1 : 0] * 125 * dur : dur * 48000 * 2 * ch * 0.55); }
+  return o;
+}
+// Make the mixer copies in the background for every saved version (one at a time, so imports stay quick).
+const mixerQueue = []; let mixerBusy = false;
+function queueMixer(hashes) { for (const h of hashes) if (h && !mixerQueue.includes(h)) mixerQueue.push(h); if (!mixerBusy) mixerNext(); }
+async function mixerNext() { mixerBusy = true; while (mixerQueue.length) { const h = mixerQueue.shift(); await mixerCopies(h).catch(e => console.error('mixer copy', e.message)); } mixerBusy = false; }
+setTimeout(() => queueMixer([...sessions.values()].flatMap(s => s.versions.flatMap(v => v.tracks.map(t => t.hash)))), 5000).unref();
+
+// Sessions as LiveWebMixer sees them (docs/LIVEVAULT-API.md in LiveWebMixer).
+const v1List = s => { const vs = [...s.versions].reverse(); return { id: s.id, name: s.name, latest: vs[0].v, versions: vs.map(v => v.v), tags: s.tags, tracks: vs[0].tracks.filter(t => t.kind !== 'off').length, duration: trackDur(vs[0].tracks) }; };
+const lwmMixFile = async (s, u, ver) => (await listMixesFull(s.id)).find(m => m.lwm && m.by === u.id && m.version === ver) || null;
+async function listMixesFull(sid) {
+  const out = [];
+  for (const f of await fsp.readdir(mixDir(sid)).catch(() => [])) if (f.endsWith('.json')) { const m = await readJson(path.join(mixDir(sid), f), null); if (m) out.push(m); }
+  return out;
 }
 
 // ---------- files with Range support ----------
@@ -530,6 +562,7 @@ function referenced() {
 }
 async function cleanup() {
   const { h, o } = referenced(); let files = 0, bytes = 0;
+  await fsp.mkdir(path.join(DATA, 'mixer'), { recursive: true });
   const sweep = async (dir, keep, re) => {
     for (const sub of await fsp.readdir(dir).catch(() => [])) for (const f of await fsp.readdir(path.join(dir, sub)).catch(() => [])) {
       const m = re.exec(f); if (!m || keep.has(m[1])) continue;
@@ -537,7 +570,7 @@ async function cleanup() {
       await fsp.unlink(p).catch(() => {}); files++; bytes += st.size;
     }
   };
-  await sweep(D.blobs, h, /^([a-f0-9]{64})\./); await sweep(D.prev, h, /^([a-f0-9]{64})\./); await sweep(D.orig, o, /^([a-f0-9]{64})\./);
+  await sweep(D.blobs, h, /^([a-f0-9]{64})\./); await sweep(D.prev, h, /^([a-f0-9]{64})\./); await sweep(path.join(DATA, 'mixer'), h, /^([a-f0-9]{64})\./); await sweep(D.orig, o, /^([a-f0-9]{64})\./);
   for (const f of await fsp.readdir(D.raw).catch(() => [])) { const r = await readJson(path.join(D.raw, f), null); if (r && !r.outs.some(x => h.has(x.hash))) await fsp.unlink(path.join(D.raw, f)).catch(() => {}); }
   for (const f of await fsp.readdir(D.tmp).catch(() => [])) await fsp.rm(path.join(D.tmp, f), { recursive: true, force: true }).catch(() => {});
   return { files, bytes };
@@ -551,22 +584,39 @@ async function handle(req, res) {
   const isApi = seg[0] === 'api', isMedia = seg[0] === 'media';
   if (!isApi && !isMedia) return m === 'GET' || m === 'HEAD' ? serveStatic(req, res, p) : send(res, 405, 'Method not allowed');
 
-  // ---- LiveWebMixer link (ticket in the Authorization header, no cookie) ----
-  if (isApi && seg[1] === 'link') {
-    const L = ticketUser(req); if (!L) return send(res, 401, { error: 'This LiveVault link has expired. Open the session from LiveVault again.' });
-    const { t, u, s, v } = L;
-    if (seg.length === 2 && m === 'GET') {
-      let mix = null;
-      if (t.mixId) { const mm = await readJson(path.join(mixDir(s.id), t.mixId + '.json'), null); if (mm && mixVisible(u, mm)) mix = { id: mm.id, name: mm.name, mine: mm.by === u.id, data: mm.data }; }
-      return send(res, 200, { vault: VERSION, user: u.display, expires: t.expires, session: { id: s.id, name: s.name, artist: s.artist, bpm: s.bpm, key: s.key, listenFor: s.listenFor },
-        version: v.v, tracks: v.tracks.map(x => ({ id: x.id, name: x.name, kind: x.kind, hash: x.hash, channels: x.channels, duration: x.duration })), mix });
+  // ---- LiveVault API version 1, for LiveWebMixer (personal access token in the Authorization header) ----
+  if (isApi && seg[1] === 'v1') {
+    const u = tokenUser(req); if (!u) return send(res, 401, { error: 'Missing or wrong access token' });
+    if (seg[2] === 'info' && m === 'GET') return send(res, 200, { name: 'LiveVault', version: VERSION, api: 1, user: u.display });
+    if (seg[2] === 'sessions' && seg.length === 3 && m === 'GET') {
+      const qq = (q.get('q') || '').toLowerCase();
+      return send(res, 200, { sessions: [...sessions.values()].filter(s => visible(u, s) && s.versions.length && (!qq || (s.name + ' ' + s.artist + ' ' + s.tags.join(' ')).toLowerCase().includes(qq))).sort((a, b) => natural(a.name, b.name)).map(v1List) });
     }
-    if (seg[2] === 'file' && okHash(seg[3]) && (m === 'GET' || m === 'HEAD')) {
-      if (!v.tracks.some(x => x.hash === seg[3])) return send(res, 404, 'Not found');
-      return serveFile(req, res, blobPath(seg[3]), 'audio/wav');
+    if (seg[2] === 'sessions' && seg[4] === 'versions') {
+      const s = getVisible(u, seg[3]), v = s.versions.find(x => x.v === seg[5]);
+      if (!v) return send(res, 404, { error: 'No such version' });
+      if (seg.length === 6 && m === 'GET') {
+        queueMixer(v.tracks.map(t => t.hash));
+        const tracks = [];
+        for (const t of v.tracks) if (t.kind !== 'off') tracks.push({ id: t.id, name: t.name, file: t.hash, role: t.kind, channels: t.channels > 1 ? 2 : 1, duration: t.duration, sizes: await mixerSizes(t.hash, t.channels, t.duration) });
+        return send(res, 200, { id: s.id, name: s.name, version: v.v, versions: [...s.versions].reverse().map(x => x.v), tags: s.tags, notes: [s.listenFor && 'Listen for: ' + s.listenFor, s.notes].filter(Boolean).join('\n\n'), tracks });
+      }
+      if (seg[6] === 'mixes' && seg[7] === 'livewebmixer' && seg.length === 8) {
+        const mm = await lwmMixFile(s, u, v.v);
+        if (m === 'GET') return mm ? send(res, 200, mm.data) : send(res, 404, { error: 'No mix saved yet' });
+        if (m === 'PUT') { if (!can(u, 'mix')) return send(res, 403, { error: 'This access token may not save mixes' }); await saveMix(s, u, { mixId: mm && mm.id, data: await readBody(req), lwm: true }, v.v); return send(res, 200, { ok: true }); }
+      }
+      if (seg[6] === 'recordings' && seg.length === 7 && m === 'PUT') {
+        if (!can(u, 'mix')) return send(res, 403, { error: 'This access token may not save recordings' });
+        const mm = await lwmMixFile(s, u, v.v); if (mm) q.set('mixId', mm.id); else q.delete('mixId');
+        return send(res, 200, await addRecording(req, s, u, v.v, q));
+      }
     }
-    if (seg[2] === 'mixes' && seg.length === 3 && m === 'POST') return send(res, 200, await saveMix(s, u, await readBody(req), v.v));
-    if (seg[2] === 'recordings' && seg.length === 3 && m === 'PUT') return send(res, 200, await addRecording(req, s, u, v.v, q));
+    if (seg[2] === 'files' && okHash(seg[3]) && MIXQ[seg[4]] && (m === 'GET' || m === 'HEAD')) {
+      if (![...sessions.values()].some(s => visible(u, s) && s.versions.some(v => v.tracks.some(t => t.hash === seg[3])))) return send(res, 404, { error: 'No such file' });
+      await mixerCopies(seg[3]);
+      return serveFile(req, res, mixerPath(seg[3], seg[4]), MIXQ[seg[4]].mime, { 'Cache-Control': 'public, max-age=31536000, immutable' });
+    }
     return send(res, 404, { error: 'Not found' });
   }
 
@@ -620,6 +670,16 @@ async function handle(req, res) {
     if (b.password !== undefined) { if (!checkPw(u, b.oldPassword || '')) return send(res, 400, { error: 'Your current password is not right' }); const pp = pwProblem(b.password); if (pp) return send(res, 400, { error: pp }); setPw(u, b.password); }
     await saveUsers(); return send(res, 200, { user: pubUser(u) });
   }
+  if (seg[1] === 'me' && seg[2] === 'tokens') {
+    u.tokens = u.tokens || [];
+    if (seg.length === 3 && m === 'GET') return send(res, 200, { tokens: u.tokens.map(pubToken) });
+    if (seg.length === 3 && m === 'POST') {
+      const b = await readBody(req), value = 'lv_' + id(24), t = { id: id(4), name: str(b.name, 60) || 'LiveWebMixer', sha: sha(value), created: now(), used: null };
+      if (u.tokens.length >= 20) return send(res, 400, { error: 'You already have 20 access tokens; remove one first' });
+      u.tokens.push(t); await saveUsers(); return send(res, 200, { token: value, ...pubToken(t) });
+    }
+    if (okId(seg[3]) && m === 'DELETE') { u.tokens = u.tokens.filter(t => t.id !== seg[3]); await saveUsers(); return send(res, 200, { tokens: u.tokens.map(pubToken) }); }
+  }
   if (seg[1] === 'people' && m === 'GET') return send(res, 200, { people: users.filter(x => !x.disabled).map(x => ({ id: x.id, display: x.display })) });
 
   // ---- users (admin) ----
@@ -659,7 +719,7 @@ async function handle(req, res) {
     if (m === 'GET') return send(res, 200, { settings, watch: watchOn(), watchDir: WATCH, sources: SOURCES });
     if (m === 'PUT') {
       const b = await readBody(req), url = v => { v = str(v, 300).replace(/\/+$/, ''); if (v && !/^https?:\/\/[^\s]+$/i.test(v)) throw httpErr(400, 'Addresses start with http:// or https://'); return v; };
-      settings = { lwmUrl: url(b.lwmUrl), vaultUrl: url(b.vaultUrl), keepOriginals: b.keepOriginals !== false, watchSource: SOURCES.includes(b.watchSource) ? b.watchSource : 'sq5' };
+      settings = { lwmUrl: url(b.lwmUrl), keepOriginals: b.keepOriginals !== false, watchSource: SOURCES.includes(b.watchSource) ? b.watchSource : 'sq5' };
       await writeJson(SETTINGS_F, settings); return send(res, 200, { settings });
     }
   }
@@ -667,7 +727,7 @@ async function handle(req, res) {
     if (!u.admin) return send(res, 403, { error: 'Only admins can see storage' });
     if (m === 'GET') {
       const fsInfo = await fsp.statfs(DATA).catch(() => null);
-      return send(res, 200, { audio: await dirSize(D.blobs), originals: await dirSize(D.orig), previews: await dirSize(D.prev), mixes: await dirSize(D.mixes), recordings: await dirSize(D.recs),
+      return send(res, 200, { audio: await dirSize(D.blobs), originals: await dirSize(D.orig), previews: await dirSize(D.prev) + await dirSize(path.join(DATA, 'mixer')), mixes: await dirSize(D.mixes), recordings: await dirSize(D.recs),
         free: fsInfo ? fsInfo.bavail * fsInfo.bsize : null, sessions: sessions.size, busy: running + queue.length });
     }
     if (seg[2] === 'cleanup' && m === 'POST') { if (running + queue.length) return send(res, 400, { error: 'Wait until all tracks have finished converting' }); return send(res, 200, await cleanup()); }
@@ -726,6 +786,7 @@ async function handle(req, res) {
     if (seg[3] === 'versions' && seg.length === 4 && m === 'POST') {
       need('upload'); const b = await readBody(req); let v;
       const out = await withSession(sid, x => { v = saveVersion(x, u.id, b.bump, b.message); });
+      queueMixer(out.versions[out.versions.length - 1].tracks.map(t => t.hash));
       return send(res, 200, { version: v, session: sessionOut(u, out) });
     }
     if (seg[3] === 'restore' && m === 'POST') {
@@ -753,10 +814,8 @@ async function handle(req, res) {
       if (!settings.lwmUrl) return send(res, 400, { error: 'An admin needs to enter the LiveWebMixer address in LiveVault Settings first' });
       const b = await readBody(req), v = s.versions.find(x => x.v === b.version) || latest(s);
       if (!v) return send(res, 400, { error: 'Save a version of this session first' });
-      let mixId = null;
-      if (okId(b.mixId)) { const mm = await readJson(path.join(mixDir(sid), b.mixId + '.json'), null); if (!mm || !mixVisible(u, mm)) return send(res, 404, { error: 'Mix not found' }); mixId = mm.id; }
-      const t = id(24); tickets[sha(t)] = { uid: u.id, sid, version: v.v, mixId, created: now(), expires: now() + TICKET_DAYS * 864e5 }; saveTickets();
-      return send(res, 200, { url: `${settings.lwmUrl}/#vault=${encodeURIComponent(vaultUrlFor(req))}&ticket=${t}`, version: v.v });
+      queueMixer(v.tracks.map(t => t.hash));
+      return send(res, 200, { url: `${settings.lwmUrl}/#vault=${encodeURIComponent(sid)}&version=${encodeURIComponent(v.v)}`, version: v.v });
     }
     if (seg[3] === 'recordings') {
       if (seg.length === 4 && m === 'GET') return send(res, 200, { recordings: (await listRecordings(sid)).filter(x => mixVisible(u, x)) });

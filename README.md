@@ -10,7 +10,7 @@ The multitrack library for [LiveWebMixer](https://github.com/leonidis2013/LiveWe
 - **Licenses:** mark purchased sessions with who holds the license and its terms, and restrict them to people with "Licensed sessions" access or to named people.
 - **People and permissions:** every user gets their own set: add and edit, edit info, delete, download, mix, see all mixes, licensed sessions. Admins can do everything.
 - **Preview player:** waveforms for every track, play the whole session in the browser with mute and solo, and A/B against the reference mix.
-- **Mixes:** mixes saved from LiveWebMixer are stored with the exact version they were made on. Trainees see their own mixes plus any mix marked as a reference.
+- **Mixes:** each person's LiveWebMixer mix is stored with the exact version it was made on. Trainees see their own mixes plus any mix marked as a reference.
 - **Recordings for review:** press Record in LiveWebMixer and the Main LR mix is captured while the song plays and saved to LiveVault. It is linked to the version and the mix, plays back with an A/B against the reference mix at the same point in the song, and has a review notes field for feedback.
 - **Watch folder:** drop a folder of tracks (or a zip) into a shared folder and it becomes a session with version 1.0.0 on its own. Interleaved multichannel files are split into one track per channel.
 
@@ -24,7 +24,7 @@ Open **https://<server IP>:9543**, accept the certificate warning once, and crea
 
 For TrueNAS, paste `truenas-app.yaml` into Apps > Discover Apps > Custom App > Install via YAML.
 
-Everything LiveVault keeps (tracks, sessions, mixes, recordings, users, certificate) is in the `livevault-data` volume. Port 9580 is plain http; LiveWebMixer downloads tracks through it, and a reverse proxy can use it too.
+Everything LiveVault keeps (tracks, sessions, mixes, recordings, users, certificate) is in the `livevault-data` volume. Port 9580 is plain http; LiveWebMixer reaches LiveVault through it, and a reverse proxy can use it too.
 
 ### Watch folder (optional)
 
@@ -32,14 +32,15 @@ The watch folder is the one thing that is not inside the volume, because it need
 
 ## Connect LiveWebMixer
 
-In LiveVault **Settings**:
+LiveWebMixer 0.3.0 or newer plays sessions straight from LiveVault and saves mixes and Main LR takes back to it, using the API in its `docs/LIVEVAULT-API.md`.
 
-1. **LiveWebMixer address:** the address you open LiveWebMixer at, for example `https://192.168.1.20:9443`.
-2. **LiveVault address for LiveWebMixer:** how the LiveWebMixer container reaches LiveVault, for example `http://192.168.1.20:9580`. Leave it empty to use this server's address with port 9580.
+1. In LiveVault, open **My account** (your name, top right) and make an **access token**. Copy it; it is shown once.
+2. In LiveWebMixer's Setup, open the **LiveVault library** card and enter LiveVault's http address (for example `http://192.168.1.20:9580`) and the token.
+3. In LiveVault **Settings**, enter the LiveWebMixer address (for example `https://192.168.1.20:9443`). Sessions then get an **Open in LiveWebMixer** button that opens that version there.
 
-Then **Open in LiveWebMixer** on a session (or **Open** on a mix) opens LiveWebMixer in a new tab. LiveWebMixer downloads the tracks, builds the mixer, and shows **Save to LiveVault** and **Record** in the transport bar. The link belongs to the person who opened it and lasts 7 days; their mixes and recordings are saved under their name.
+A token acts as the person who made it, with their permissions: the mixer lists the sessions they may see, and their mix of each version and their takes are saved under their name. Each person keeps one LiveWebMixer mix per version. Remove a token under My account to cut that mixer off.
 
-LiveWebMixer 0.2.0 or newer is needed.
+LiveVault makes 48 kHz FLAC and Opus copies of each track for the mixer in the background when a version is saved, so the first load does not wait for conversion.
 
 ## Good to know
 

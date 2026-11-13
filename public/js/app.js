@@ -29,6 +29,7 @@ const PERM = { upload: ['Add and edit', 'Create sessions, upload tracks, save ve
   delete: ['Delete', 'Delete sessions and other people\'s mixes and recordings'], download: ['Download', 'Download the audio files'], mix: ['Mix', 'Open sessions in LiveWebMixer, save mixes and recordings'],
   seeMixes: ['See all mixes', 'See everyone\'s mixes and recordings, not only their own'], licensed: ['Licensed sessions', 'See sessions marked as license-restricted'] };
 
+let newTok = '';
 const S = { st: null, user: null, sessions: [], s: null, view: null, mixes: [], recs: [], people: [], q: '', fSrc: '', fDiff: '', fTag: '', msg: '', up: '', bump: 'minor' };
 
 // =====================================================================================
@@ -45,11 +46,12 @@ async function render() {
   renderNav();
   const r = route();
   if (r.page !== 's') { player.stop(); recPlayer.stop(); main.dataset.sid = ''; }
+  if (r.page !== 'me') newTok = '';
   try {
     if (r.page === 's' && r.a) return await sessionPage(main, r.a, r.b ? decodeURIComponent(r.b) : null);
     if (r.page === 'users') return await usersPage(main);
     if (r.page === 'settings') return await settingsPage(main);
-    if (r.page === 'me') return mePage(main);
+    if (r.page === 'me') return await mePage(main);
     return await libraryPage(main);
   } catch (e) { fill(main, h('div', { class: 'page one' }, h('div', { class: 'errbox' }, e.message), h('div', {}, h('button', { onclick: () => go('#/') }, 'Back to the library')))); }
 }
@@ -312,18 +314,18 @@ function versionsCard(s, view) {
 }
 
 // ---- mixes ----
-async function openInMixer(version, mixId) {
+async function openInMixer(version) {
   const w = window.open('', '_blank');
-  try { const j = await api('POST', `/api/sessions/${S.s.id}/open`, { version, mixId }); if (w) w.location = j.url; else location.href = j.url; }
+  try { const j = await api('POST', `/api/sessions/${S.s.id}/open`, { version }); if (w) w.location = j.url; else location.href = j.url; }
   catch (e) { if (w) w.close(); S.msg = e.message; render(); }
 }
 function mixesCard(s) {
   const sid = s.id;
   return h('div', { class: 'card' }, h('h2', {}, 'Mixes'),
-    !S.mixes.length ? h('div', { class: 'note' }, s.can.mix ? 'No mixes yet. Open the session in LiveWebMixer and use "Save to LiveVault".' : 'No mixes you can see yet.') :
+    !S.mixes.length ? h('div', { class: 'note' }, s.can.mix ? 'No mixes yet. Mixes made in LiveWebMixer are saved here, one per person for each version.' : 'No mixes you can see yet.') :
     S.mixes.map(m => h('div', { class: 'item' }, h('div', { class: 'row' },
       h('b', { class: 'grow' }, m.name, m.reference && h('span', { class: 'chip teal', style: 'margin-left:6px' }, 'Reference')),
-      s.can.mix && s.can.lwm && h('button', { class: 'sm on', onclick: () => openInMixer(m.version, m.id) }, 'Open'),
+      m.lwm && m.by === S.user.id && s.can.lwm && h('button', { class: 'sm on', title: 'Open this version in LiveWebMixer, where this mix loads', onclick: () => openInMixer(m.version) }, 'Open'),
       s.can.edit && h('button', { class: 'sm', title: 'Reference mixes are visible to everyone who can see the session', onclick: () => act(async () => { await api('PATCH', `/api/sessions/${sid}/mixes/${m.id}`, { reference: !m.reference }); await loadSession(sid); }) }, m.reference ? 'Unmark reference' : 'Mark as reference'),
       (m.by === S.user.id || S.user.admin) && h('button', { class: 'sm', onclick: () => { const n = prompt('Mix name', m.name); n && act(async () => { await api('PATCH', `/api/sessions/${sid}/mixes/${m.id}`, { name: n }); await loadSession(sid); }); } }, 'Rename'),
       h('a', { href: `/api/sessions/${sid}/mixes/${m.id}/download`, download: '' }, h('button', { class: 'sm' }, 'JSON')),
@@ -508,16 +510,14 @@ async function settingsPage(main) {
   if (!S.user.admin) return go('#/');
   const j = await api('GET', '/api/settings'), st = await api('GET', '/api/storage'), c = j.settings;
   const lwm = h('input', { type: 'text', value: c.lwmUrl, placeholder: 'https://truenas.local:9443' });
-  const vu = h('input', { type: 'text', value: c.vaultUrl, placeholder: `http://${location.hostname}:9580 (worked out automatically when empty)` });
   const keep = h('input', { type: 'checkbox', checked: c.keepOriginals });
   const ws = h('select', {}, Object.entries(SRC).map(([v, l]) => h('option', { value: v, selected: c.watchSource === v }, l)));
   let saved = '';
-  const save = () => act(async () => { await api('PUT', '/api/settings', { lwmUrl: lwm.value, vaultUrl: vu.value, keepOriginals: keep.checked, watchSource: ws.value }); S.msg = ''; saved = 'Saved'; });
+  const save = () => act(async () => { await api('PUT', '/api/settings', { lwmUrl: lwm.value, keepOriginals: keep.checked, watchSource: ws.value }); S.msg = ''; saved = 'Saved'; });
   fill(main, h('div', { class: 'page one' }, S.msg && h('div', { class: 'errbox' }, S.msg),
     h('div', { class: 'card' }, h('h2', {}, 'LiveWebMixer'),
       field('LiveWebMixer address (as your browser opens it)', lwm),
-      field('LiveVault address for LiveWebMixer (server to server, use the http port)', vu),
-      h('div', { class: 'note' }, 'When someone presses "Open in LiveWebMixer", a new tab opens LiveWebMixer, which then downloads the tracks from LiveVault and saves mixes and recordings back to it. Each link is personal and lasts 7 days.')),
+      h('div', { class: 'note' }, `Connect LiveWebMixer once from its Setup page: LiveVault address http://${location.hostname}:9580 (the http port) and an access token made under My account. LiveWebMixer then plays sessions straight from here and saves mixes and recordings as the token's owner. "Open in LiveWebMixer" on a session opens that version there.`)),
     h('div', { class: 'card' }, h('h2', {}, 'Imports'),
       h('label', { class: 'row', style: 'margin-bottom:8px' }, keep, h('span', {}, 'Keep the original file when it was not already a 96 kHz WAV')),
       field('Source for sessions from the watch folder', ws),
@@ -534,14 +534,22 @@ async function settingsPage(main) {
 // =====================================================================================
 // My account
 // =====================================================================================
-function mePage(main) {
+async function mePage(main) {
+  const toks = (await api('GET', '/api/me/tokens')).tokens;
+  const tokName = h('input', { type: 'text', class: 'grow', placeholder: 'Token name, e.g. LiveWebMixer on TrueNAS' });
   const dn = h('input', { type: 'text', value: S.user.display }), op = h('input', { type: 'password', placeholder: 'Current password' }), np = h('input', { type: 'password', placeholder: 'New password (8+ characters)' });
   let ok = '';
   const draw = () => fill(main, h('div', { class: 'page one', style: 'max-width:520px' }, S.msg && h('div', { class: 'errbox' }, S.msg),
     h('div', { class: 'card' }, h('h2', {}, 'My account'), h('div', { class: 'note', style: 'margin-bottom:8px' }, 'Signed in as ' + S.user.username),
       field('Display name', dn), field('Change password', h('div', { class: 'col', style: 'gap:6px' }, op, np)),
       h('div', { class: 'row' }, h('button', { class: 'on', onclick: async () => { try { S.msg = ''; const body = { display: dn.value }; if (np.value) Object.assign(body, { password: np.value, oldPassword: op.value }); S.user = (await api('PATCH', '/api/me', body)).user; ok = 'Saved'; op.value = np.value = ''; renderNav(); } catch (e) { S.msg = e.message; } draw(); } }, 'Save'), h('span', { class: 'ok' }, ok), h('span', { class: 'grow' }),
-        h('button', { class: 'danger', onclick: async () => { await api('POST', '/api/logout').catch(() => {}); S.user = null; location.hash = ''; render(); } }, 'Sign out')))));
+        h('button', { class: 'danger', onclick: async () => { await api('POST', '/api/logout').catch(() => {}); S.user = null; location.hash = ''; render(); } }, 'Sign out'))),
+    h('div', { class: 'card' }, h('h2', {}, 'Access tokens'),
+      h('div', { class: 'note', style: 'margin-bottom:8px' }, 'A token lets LiveWebMixer reach LiveVault as you, with your permissions: it sees the sessions you can see and saves mixes and recordings under your name. Paste it into LiveWebMixer > Setup > LiveVault library > Connection. Remove a token to cut that mixer off.'),
+      newTok && h('div', { class: 'draft' }, h('div', { class: 'note' }, 'Copy this token now. It is not shown again.'), h('div', { class: 'row', style: 'margin-top:6px' }, h('input', { type: 'text', readOnly: true, value: newTok, class: 'grow', onfocus: e => e.target.select() }), h('button', { class: 'sm', onclick: () => navigator.clipboard && navigator.clipboard.writeText(newTok) }, 'Copy'))),
+      toks.map(t => h('div', { class: 'li row', style: 'padding:6px 0;border-top:1px solid var(--line)' }, h('b', { class: 'grow' }, t.name), h('span', { class: 'note' }, `made ${fmtDate(t.created)} · ${t.used ? 'last used ' + fmtWhen(t.used) : 'not used yet'}`),
+        h('button', { class: 'sm danger', onclick: () => confirm(`Remove the token "${t.name}"? Anything using it stops working.`) && act(async () => { await api('DELETE', '/api/me/tokens/' + t.id); }) }, 'Remove'))),
+      h('div', { class: 'row', style: 'margin-top:8px' }, tokName, h('button', { class: 'on', onclick: () => act(async () => { const r = await api('POST', '/api/me/tokens', { name: tokName.value }); newTok = r.token; }, false).then(() => mePage(main)) }, 'Make a token')))));
   draw();
 }
 

@@ -89,23 +89,33 @@ async function untilReady(A, sid) { for (let i = 0; i < 200; i++) { const s = (a
       assert.strictEqual((await A('GET', `/api/sessions/${sid}/files/${h}`)).status, 200);
       assert.strictEqual((await A('GET', `/api/sessions/${sid}/files/${ts[0].origHash}?orig=1`)).status, 200);
 
-      // LiveWebMixer link
+      // LiveVault API v1 for LiveWebMixer, with the trainee's personal access token
       assert.strictEqual((await T('POST', `/api/sessions/${sid}/open`, {})).status, 400, 'needs the LiveWebMixer address');
-      await A('PUT', '/api/settings', { lwmUrl: 'https://mixer.local:9443', vaultUrl: 'http://127.0.0.1:' + port });
-      r = await T('POST', `/api/sessions/${sid}/open`, { version: '1.0.1' }); assert.strictEqual(r.status, 200);
-      const ticket = /ticket=([a-f0-9]+)/.exec(r.body.url)[1]; assert.ok(r.body.url.startsWith('https://mixer.local:9443/#vault='));
-      const L = (m, u, b, ct) => fetch(base + u, { method: m, headers: { Authorization: 'Bearer ' + ticket, ...(ct ? { 'Content-Type': ct } : {}) }, body: b });
-      assert.strictEqual((await fetch(base + '/api/link', { headers: { Authorization: 'Bearer ' + 'f'.repeat(48) } })).status, 401);
-      const link = await (await L('GET', '/api/link')).json();
-      assert.strictEqual(link.version, '1.0.1'); assert.strictEqual(link.tracks[0].name, 'Piano'); assert.strictEqual(link.user, 'Trainee');
-      r = await L('GET', '/api/link/file/' + link.tracks[0].hash); assert.strictEqual(r.status, 200); assert.ok((await r.arrayBuffer()).byteLength > 1000);
-      assert.strictEqual((await L('GET', '/api/link/file/' + 'a'.repeat(64))).status, 404);
-      const mix = await (await L('POST', '/api/link/mixes', JSON.stringify({ name: 'First try', data: { scenes: [], current: { x: 1 } } }), 'application/json')).json();
-      assert.ok(mix.id); assert.strictEqual(mix.version, '1.0.1');
-      const again = await (await L('POST', '/api/link/mixes', JSON.stringify({ mixId: mix.id, data: { scenes: [], current: { x: 2 } } }), 'application/json')).json();
-      assert.strictEqual(again.id, mix.id, 'same mix updated');
-      r = await L('PUT', `/api/link/recordings?name=Run%201&mixId=${mix.id}&start=12.5`, tone(500, 48000, 2, 2), 'audio/wav'); assert.strictEqual(r.status, 200);
-      const rec = await r.json(); assert.strictEqual(rec.mixName, 'First try'); assert.strictEqual(rec.start, 12.5); assert.ok(rec.duration > 1.9);
+      await A('PUT', '/api/settings', { lwmUrl: 'https://mixer.local:9443' });
+      r = await T('POST', `/api/sessions/${sid}/open`, { version: '1.0.1' }); assert.strictEqual(r.body.url, `https://mixer.local:9443/#vault=${sid}&version=1.0.1`);
+      r = await T('POST', '/api/me/tokens', { name: 'Mixer' }); const tok = r.body.token; assert.ok(/^lv_[a-f0-9]{48}$/.test(tok));
+      assert.strictEqual((await T('GET', '/api/me/tokens')).body.tokens.length, 1);
+      const L = (m, u, b, ct) => fetch(base + u, { method: m, headers: { Authorization: 'Bearer ' + tok, ...(ct ? { 'Content-Type': ct } : {}) }, body: b });
+      assert.strictEqual((await fetch(base + '/api/v1/info', { headers: { Authorization: 'Bearer lv_' + 'f'.repeat(48) } })).status, 401);
+      const info = await (await L('GET', '/api/v1/info')).json(); assert.strictEqual(info.name, 'LiveVault'); assert.strictEqual(info.api, 1);
+      const list = await (await L('GET', '/api/v1/sessions?q=goodness')).json();
+      assert.strictEqual(list.sessions.length, 1); assert.strictEqual(list.sessions[0].latest, '2.0.0'); assert.deepStrictEqual(list.sessions[0].versions, ['2.0.0', '1.0.1', '1.0.0']);
+      const ver = await (await L('GET', `/api/v1/sessions/${sid}/versions/1.0.1`)).json();
+      assert.strictEqual(ver.tracks[0].name, 'Piano'); assert.strictEqual(ver.tracks[6].role, 'reference'); assert.ok(ver.tracks[0].sizes.flac > 0); assert.ok(ver.notes === '');
+      for (const qq of ['flac', 'hi', 'lo']) { r = await L('GET', `/api/v1/files/${ver.tracks[0].file}/${qq}`, undefined); assert.strictEqual(r.status, 200, qq); assert.ok((await r.arrayBuffer()).byteLength > 100); }
+      r = await fetch(`${base}/api/v1/files/${ver.tracks[0].file}/flac`, { headers: { Authorization: 'Bearer ' + tok, Range: 'bytes=0-9' } }); assert.strictEqual(r.status, 206); assert.strictEqual((await r.arrayBuffer()).byteLength, 10);
+      const fst = JSON.parse(spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=sample_rate', '-of', 'json', path.join(data, 'd', 'mixer', ver.tracks[0].file.slice(0, 2), ver.tracks[0].file + '.flac')]).stdout).streams[0];
+      assert.strictEqual(+fst.sample_rate, 48000, 'mixer copies are 48 kHz');
+      assert.strictEqual((await L('GET', `/api/v1/files/${'a'.repeat(64)}/flac`)).status, 404);
+      const mixPath = `/api/v1/sessions/${sid}/versions/1.0.1/mixes/livewebmixer`;
+      assert.strictEqual((await L('GET', mixPath)).status, 404);
+      assert.strictEqual((await L('PUT', mixPath, JSON.stringify({ scenes: [{ name: 'Rough', mixer: {} }], current: { x: 1 } }), 'application/json')).status, 200);
+      assert.strictEqual((await L('PUT', mixPath, JSON.stringify({ scenes: [{ name: 'Rough', mixer: {} }], current: { x: 2 } }), 'application/json')).status, 200);
+      assert.deepStrictEqual((await (await L('GET', mixPath)).json()).current, { x: 2 });
+      r = await T('GET', `/api/sessions/${sid}/mixes`); assert.strictEqual(r.body.mixes.length, 1, 'one mix per person and version'); const mix = r.body.mixes[0];
+      assert.strictEqual(mix.name, "Trainee's mix"); assert.strictEqual(mix.version, '1.0.1'); assert.strictEqual(mix.lwm, true);
+      r = await L('PUT', `/api/v1/sessions/${sid}/versions/1.0.1/recordings?name=Run%201&start=12.5`, tone(500, 48000, 2, 2), 'audio/wav'); assert.strictEqual(r.status, 200);
+      const rec = await r.json(); assert.strictEqual(rec.mixName, "Trainee's mix"); assert.strictEqual(rec.start, 12.5); assert.ok(rec.duration > 1.9);
       r = await T('GET', `/api/sessions/${sid}/recordings`); assert.strictEqual(r.body.recordings.length, 1);
       assert.strictEqual((await T('GET', `/media/rec/${sid}/${rec.id}`)).status, 200);
       assert.strictEqual((await T('PATCH', `/api/sessions/${sid}/recordings/${rec.id}`, { notes: 'x' })).status, 403, 'trainee cannot write review notes');
@@ -117,12 +127,11 @@ async function untilReady(A, sid) { for (let i = 0; i < 200; i++) { const s = (a
       assert.strictEqual((await O('GET', `/api/sessions/${sid}/mixes`)).body.mixes.length, 0);
       await A('PATCH', `/api/sessions/${sid}/mixes/${mix.id}`, { reference: true });
       assert.strictEqual((await O('GET', `/api/sessions/${sid}/mixes`)).body.mixes.length, 1);
-      r = await O('POST', `/api/sessions/${sid}/open`, { mixId: mix.id }); const t2 = /ticket=([a-f0-9]+)/.exec(r.body.url)[1];
-      const l2 = await (await fetch(base + '/api/link', { headers: { Authorization: 'Bearer ' + t2 } })).json();
-      assert.strictEqual(l2.version, '2.0.0'); assert.deepStrictEqual(l2.mix.data.current, { x: 2 }); assert.strictEqual(l2.mix.mine, false);
-      // a disabled user's tickets stop working
+      // a token without the mix permission can read but not save; a disabled user's tokens stop working
+      await A('PATCH', '/api/users/' + tid, { perms: { mix: false } });
+      assert.strictEqual((await L('PUT', mixPath, '{}', 'application/json')).status, 403);
       await A('PATCH', '/api/users/' + tid, { disabled: true });
-      assert.strictEqual((await L('GET', '/api/link')).status, 401);
+      assert.strictEqual((await L('GET', '/api/v1/info')).status, 401);
 
       // watch folder: a folder of files becomes a session with version 1.0.0
       const wd = path.join(watch, 'Sunday 11-09'); fs.mkdirSync(wd);
