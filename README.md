@@ -12,6 +12,8 @@ The multitrack library for [LiveWebMixer](https://github.com/leonidis2013/LiveWe
 - **Preview player:** waveforms for every track, play the whole session in the browser with mute and solo, and A/B against the reference mix.
 - **Mixes:** each person's LiveWebMixer mix is stored with the exact version it was made on. Trainees see their own mixes plus any mix marked as a reference.
 - **Recordings for review:** press Record in LiveWebMixer and the Main LR mix is captured while the song plays and saved to LiveVault. It is linked to the version and the mix, plays back with an A/B against the reference mix at the same point in the song, and has a review notes field for feedback.
+- **Drop folders in the browser:** drag a folder of tracks, a folder of song folders, or loose files onto the library (or pick a folder). LiveVault shows what becomes a session (each folder of tracks, each song folder with its subfolders, or all one session) before uploading, then saves version 1.0.0 once the tracks have converted. Dropping a folder onto a session's track list adds everything in it.
+- **Recorded date:** each session has the date it was recorded, filled in from the oldest file (the modified date for files dropped in the browser, which is all a browser can see; the creation date for the watch folder). Change it by hand any time; the library can sort newest first.
 - **Watch folder:** drop a folder of tracks (or a zip) into a shared folder and it becomes a session with version 1.0.0 on its own. Interleaved multichannel files are split into one track per channel.
 
 ## Install

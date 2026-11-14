@@ -70,6 +70,10 @@ const hashFile = f => new Promise((resolve, reject) => { const h = crypto.create
 const moveFile = async (a, b) => { await fsp.mkdir(path.dirname(b), { recursive: true }); await fsp.rename(a, b).catch(async () => { await fsp.copyFile(a, b); await fsp.unlink(a); }); };
 const cleanName = file => path.basename(file, path.extname(file)).replace(/^\d+[\s_.\-]*/, '').replace(/[_]+/g, ' ').replace(/\s+/g, ' ').trim() || path.basename(file);
 const isRefName = n => /\b(reference|ref ?mix|full ?mix|mixdown|master)\b/i.test(n);
+const okDate = d => typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d) && !isNaN(Date.parse(d));
+const localDate = ms => new Date(ms).toLocaleDateString('en-CA', { timeZone: process.env.TZ || undefined });   // YYYY-MM-DD in the server's time zone
+// The session's original date follows the oldest imported file until someone sets it by hand.
+function noteFileDate(s, d) { if (!okDate(d) || s.recordedAuto === false) return; if (!s.recorded || d < s.recorded) { s.recorded = d; s.recordedAuto = true; } }
 const natural = (a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
 
 // Serialized read-modify-write on one JSON file (fn may mutate; return false to skip the write).
@@ -158,12 +162,12 @@ const findVersion = (s, v) => v === 'draft' ? (s.draft ? { v: 'draft', tracks: s
 const trackDur = ts => Math.max(0, ...ts.map(t => t.duration || 0));
 function summary(s) {
   const l = latest(s), ts = l ? l.tracks : (s.draft ? s.draft.tracks : []);
-  return { id: s.id, name: s.name, artist: s.artist, source: s.source, tags: s.tags, difficulty: s.difficulty, bpm: s.bpm, key: s.key, version: l ? l.v : null,
+  return { id: s.id, name: s.name, artist: s.artist, source: s.source, tags: s.tags, difficulty: s.difficulty, bpm: s.bpm, key: s.key, recorded: s.recorded || '', version: l ? l.v : null,
     tracks: ts.filter(t => t.kind !== 'off').length, duration: trackDur(ts), restricted: !!s.license.restricted, draft: !!s.draft, created: s.created, updated: s.updated };
 }
 function newSession(b, uid) {
   return { id: id(4), name: str(b.name, 100) || 'New session', artist: str(b.artist, 100), source: SOURCES.includes(b.source) ? b.source : 'other', sourceNote: '', bpm: '', key: '',
-    tags: [], difficulty: '', notes: '', listenFor: '', license: { kind: 'none', holder: '', terms: '', restricted: false, allow: [] },
+    recorded: okDate(b.recorded) ? b.recorded : '', recordedAuto: !okDate(b.recorded), tags: [], difficulty: '', notes: '', listenFor: '', license: { kind: 'none', holder: '', terms: '', restricted: false, allow: [] },
     created: now(), createdBy: uid, updated: now(), versions: [], draft: null };
 }
 function applyMeta(s, b) {
@@ -171,6 +175,7 @@ function applyMeta(s, b) {
   for (const k of ['artist', 'sourceNote', 'key']) if (typeof b[k] === 'string') s[k] = str(b[k], 100);
   if (b.bpm !== undefined) s.bpm = str(String(b.bpm), 12);
   if (SOURCES.includes(b.source)) s.source = b.source;
+  if (b.recorded === '' || okDate(b.recorded)) { s.recorded = b.recorded; s.recordedAuto = b.recorded === ''; }
   if (['', 'beginner', 'intermediate', 'advanced'].includes(b.difficulty)) s.difficulty = b.difficulty;
   if (typeof b.notes === 'string') s.notes = b.notes.slice(0, 20000);
   if (typeof b.listenFor === 'string') s.listenFor = b.listenFor.slice(0, 5000);
@@ -367,7 +372,7 @@ async function streamTo(req, file) {
     req.pipe(ws); ws.on('finish', resolve); ws.on('error', reject); req.on('error', reject); req.on('aborted', () => reject(new Error('Upload interrupted')));
   });
 }
-async function handleUpload(req, res, u, s, name, replace) {
+async function handleUpload(req, res, u, s, name, replace, date) {
   name = path.basename(String(name || 'track'));
   const ext = path.extname(name).toLowerCase();
   if (ext !== '.zip' && !AUDIO_EXT.has(ext)) return send(res, 400, { error: 'Not an audio file or zip: ' + name });
@@ -381,6 +386,7 @@ async function handleUpload(req, res, u, s, name, replace) {
       if (!files.length) throw httpErr(400, 'No audio files in that zip');
       for (const f of files) await addTrack(s.id, u.id, f, path.basename(f));
     } else await addTrack(s.id, u.id, tmp, name, replace || null);
+    if (okDate(date)) await withSession(s.id, x => { const before = x.recorded; noteFileDate(x, date); if (x.recorded === before) return false; });
     send(res, 200, sessionOut(u, sessions.get(s.id)));
   } catch (e) { send(res, e.code || 400, { error: e.message }); }
   finally { fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {}); }
@@ -428,13 +434,18 @@ async function scanWatch() {
 }
 async function importWatched(name, p, isZip, files) {
   const s = newSession({ name: name.replace(/\.zip$/i, '').replace(/[_]+/g, ' ').trim(), source: settings.watchSource }, 'watch');
-  s.draft = { base: null, by: 'watch', started: now(), tracks: [], autoSave: 'Imported from the watch folder' };
+  s.draft = { base: null, by: 'watch', started: now(), tracks: [] };
   await writeJson(path.join(D.sessions, s.id + '.json'), s); sessions.set(s.id, s);
   const tmpDir = await fsp.mkdtemp(path.join(D.tmp, 'watch-'));
+  let oldest = Infinity;
+  for (const f of files) { const st = await fsp.stat(f).catch(() => null); if (st) oldest = Math.min(oldest, st.birthtimeMs > 0 ? st.birthtimeMs : st.mtimeMs, st.mtimeMs); }
+  if (oldest < Infinity) await withSession(s.id, x => noteFileDate(x, localDate(oldest)));
   try {
     if (isZip) files = await unzipTo(p, path.join(tmpDir, 'x'));
     for (const f of files) { const t = path.join(tmpDir, id(6) + path.extname(f)); await fsp.copyFile(f, t); await addTrack(s.id, 'watch', t, path.basename(f)); }
   } finally { fsp.rm(tmpDir, { recursive: true, force: true }).catch(() => {}); }
+  // save version 1.0.0 once every track has converted (set only now, so it never saves with half the files)
+  await withSession(s.id, x => { if (!x.draft) return false; x.draft.autoSave = 'Imported from the watch folder'; maybeAutoSave(x); });
   console.log(`watch folder: imported "${s.name}" (${files.length} files)`);
 }
 setInterval(scanWatch, +(process.env.WATCH_SCAN_MS || 15e3)).unref();
@@ -517,7 +528,7 @@ async function mixerNext() { mixerBusy = true; while (mixerQueue.length) { const
 setTimeout(() => queueMixer([...sessions.values()].flatMap(s => s.versions.flatMap(v => v.tracks.map(t => t.hash)))), 5000).unref();
 
 // Sessions as LiveWebMixer sees them (docs/LIVEVAULT-API.md in LiveWebMixer).
-const v1List = s => { const vs = [...s.versions].reverse(); return { id: s.id, name: s.name, latest: vs[0].v, versions: vs.map(v => v.v), tags: s.tags, tracks: vs[0].tracks.filter(t => t.kind !== 'off').length, duration: trackDur(vs[0].tracks) }; };
+const v1List = s => { const vs = [...s.versions].reverse(); return { id: s.id, name: s.name, latest: vs[0].v, versions: vs.map(v => v.v), tags: s.tags, recorded: s.recorded || '', tracks: vs[0].tracks.filter(t => t.kind !== 'off').length, duration: trackDur(vs[0].tracks) }; };
 const lwmMixFile = async (s, u, ver) => (await listMixesFull(s.id)).find(m => m.lwm && m.by === u.id && m.version === ver) || null;
 async function listMixesFull(sid) {
   const out = [];
@@ -753,12 +764,17 @@ async function handle(req, res) {
         return send(res, 200, { ok: true });
       }
     }
-    if (seg[3] === 'upload' && m === 'PUT') { need('upload'); return handleUpload(req, res, u, s, q.get('name'), okId(q.get('replace')) ? q.get('replace') : null); }
+    if (seg[3] === 'upload' && m === 'PUT') { need('upload'); return handleUpload(req, res, u, s, q.get('name'), okId(q.get('replace')) ? q.get('replace') : null, q.get('date')); }
     if (seg[3] === 'draft') {
       need('upload');
       if (seg.length === 4 && m === 'PATCH') {
         const b = await readBody(req);
         return send(res, 200, sessionOut(u, await withSession(sid, x => { const d = ensureDraft(x, u.id); if (Array.isArray(b.order)) { const pos = new Map(d.tracks.map((t, k) => { const i = b.order.indexOf(t.id); return [t.id, i < 0 ? 1e6 + k : i]; })); d.tracks.sort((a, c) => pos.get(a.id) - pos.get(c.id)); } })));
+      }
+      if (seg[4] === 'finish' && m === 'POST') {
+        // all files of a dropped folder are uploaded: save the first version as soon as they have converted
+        const b = await readBody(req);
+        return send(res, 200, sessionOut(u, await withSession(sid, x => { if (!x.draft) return false; x.draft.autoSave = str(b.message, 200) || 'Imported from a dropped folder'; maybeAutoSave(x); })));
       }
       if (seg[4] === 'discard' && m === 'POST') {
         let gone = [];

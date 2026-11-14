@@ -56,8 +56,9 @@ async function untilReady(A, sid) { for (let i = 0; i < 200; i++) { const s = (a
 
     if (hasFfmpeg) {
       r = await A('PUT', `/api/sessions/${sid}/upload?name=01_Kick.wav`, tone(60, 48000, 1)); assert.strictEqual(r.status, 200);
-      r = await A('PUT', `/api/sessions/${sid}/upload?name=02_Keys.wav`, tone(440, 96000, 2)); assert.strictEqual(r.status, 200);
-      r = await A('PUT', `/api/sessions/${sid}/upload?name=Drums.wav`, tone(200, 48000, 4)); assert.strictEqual(r.status, 200);
+      r = await A('PUT', `/api/sessions/${sid}/upload?name=02_Keys.wav&date=2026-03-08`, tone(440, 96000, 2)); assert.strictEqual(r.status, 200); assert.strictEqual(r.body.recorded, '2026-03-08');
+      r = await A('PUT', `/api/sessions/${sid}/upload?name=Drums.wav&date=2026-03-01`, tone(200, 48000, 4)); assert.strictEqual(r.body.recorded, '2026-03-01', 'oldest file wins');
+
       r = await A('PUT', `/api/sessions/${sid}/upload?name=Full Mix.wav`, tone(300, 48000, 2)); assert.strictEqual(r.status, 200);
       let s = await untilReady(A, sid), ts = s.draft.tracks;
       assert.deepStrictEqual(ts.map(t => t.status), Array(7).fill('ready'), JSON.stringify(ts.map(t => t.error)));
@@ -67,10 +68,19 @@ async function untilReady(A, sid) { for (let i = 0; i < 200; i++) { const s = (a
       const st = JSON.parse(spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=sample_rate,bits_per_sample', '-of', 'json', path.join(data, 'd', 'blobs', ts[0].hash.slice(0, 2), ts[0].hash + '.wav')]).stdout).streams[0];
       assert.strictEqual(+st.sample_rate, 96000); assert.strictEqual(+st.bits_per_sample, 24);
       // same file again: stored once, same hash
-      r = await A('PUT', `/api/sessions/${sid}/upload?name=Kick copy.wav`, tone(60, 48000, 1)); s = await untilReady(A, sid);
+      r = await A('PUT', `/api/sessions/${sid}/upload?name=Kick copy.wav&date=2020-01-01`, tone(60, 48000, 1)); s = await untilReady(A, sid);
       assert.strictEqual(s.draft.tracks[7].hash, ts[0].hash);
       r = await A('DELETE', `/api/sessions/${sid}/draft/tracks/${s.draft.tracks[7].id}`); assert.strictEqual(r.body.draft.tracks.length, 7);
       r = await A('POST', `/api/sessions/${sid}/versions`, { message: 'First import' }); assert.strictEqual(r.body.version, '1.0.0');
+      r = await A('PATCH', '/api/sessions/' + sid, { recorded: '2025-12-24' }); assert.strictEqual(r.body.recordedAuto, false);
+      // a dropped folder: upload everything, then "finish" saves 1.0.0 once converted; a hand-set date is kept
+      r = await A('POST', '/api/sessions', { name: 'Dropped', source: 'daw' }); const did = r.body.id;
+      await A('PUT', `/api/sessions/${did}/upload?name=a.wav&date=2024-05-05`, tone(100, 48000, 1));
+      await A('PUT', `/api/sessions/${did}/upload?name=b.wav&date=2024-05-04`, tone(120, 48000, 1));
+      await A('POST', `/api/sessions/${did}/draft/finish`, {});
+      let ds; for (let i = 0; i < 100; i++) { ds = (await A('GET', '/api/sessions/' + did)).body; if (ds.versions.length) break; await sleep(100); }
+      assert.strictEqual(ds.versions[0].v, '1.0.0'); assert.strictEqual(ds.versions[0].tracks.length, 2); assert.strictEqual(ds.recorded, '2024-05-04'); assert.strictEqual(ds.draft, null);
+      await A('DELETE', '/api/sessions/' + did);
       r = await A('POST', `/api/sessions/${sid}/versions`, {}); assert.strictEqual(r.status, 400, 'nothing to save');
       r = await A('PATCH', `/api/sessions/${sid}/draft/tracks/${ts[1].id}`, { name: 'Piano' }); assert.strictEqual(r.body.draft.tracks[1].name, 'Piano');
       r = await A('PATCH', `/api/sessions/${sid}/draft`, { order: [ts[1].id, ts[0].id] });
@@ -139,7 +149,8 @@ async function untilReady(A, sid) { for (let i = 0; i < 200; i++) { const s = (a
       const old = new Date(Date.now() - 120e3); for (const f of fs.readdirSync(wd)) fs.utimesSync(path.join(wd, f), old, old);
       let ws;
       for (let i = 0; i < 100; i++) { ws = (await A('GET', '/api/sessions')).body.sessions.find(x => x.name === 'Sunday 11-09'); if (ws && ws.version) break; await sleep(150); }
-      assert.ok(ws && ws.version === '1.0.0', 'watch import saved a version'); assert.strictEqual(ws.source, 'sq5'); assert.strictEqual(ws.tracks, 2);
+      assert.ok(ws && ws.version === '1.0.0', 'watch import saved a version');
+      assert.ok(/^\d{4}-\d{2}-\d{2}$/.test(ws.recorded), 'watch import has a date'); assert.strictEqual(ws.source, 'sq5'); assert.strictEqual(ws.tracks, 2);
       for (let i = 0; i < 20 && fs.existsSync(wd); i++) await sleep(100);
       assert.ok(!fs.existsSync(wd) && fs.readdirSync(path.join(watch, '_imported')).length === 1, 'imported folder moved aside');
 

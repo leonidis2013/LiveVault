@@ -21,6 +21,7 @@ async function api(method, url, body) {
 const fmtTime = s => { s = Math.max(0, s || 0); const hh = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), ss = String(Math.floor(s % 60)).padStart(2, '0'); return hh ? `${hh}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`; };
 const fmtMB = b => b >= 1e12 ? (b / 1e12).toFixed(2) + ' TB' : b >= 1e9 ? (b / 1e9).toFixed(1) + ' GB' : (b / 1e6).toFixed(b < 1e7 ? 1 : 0) + ' MB';
 const fmtDate = t => t ? new Date(t).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) : '';
+const fmtDay = d => { const [y, m, dd] = d.split('-').map(Number); return new Date(y, m - 1, dd).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }); };
 const fmtWhen = t => t ? new Date(t).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) : '';
 const SRC = { sq5: 'SQ-5 recording', purchased: 'Purchased', training: 'Training pack', daw: 'Studio / DAW', other: 'Other' };
 const DIFF = { '': 'Not set', beginner: 'Beginner', intermediate: 'Intermediate', advanced: 'Advanced' };
@@ -98,7 +99,10 @@ async function libraryPage(main) {
   const st = await api('GET', '/api/state'); status(st.busy);
   const tags = [...new Set(S.sessions.flatMap(s => s.tags))].sort();
   const q = S.q.toLowerCase();
+  const sortBy = ls('sort') || 'name';
   const list = S.sessions.filter(s => (!q || (s.name + ' ' + s.artist + ' ' + s.tags.join(' ')).toLowerCase().includes(q)) && (!S.fSrc || s.source === S.fSrc) && (!S.fDiff || s.difficulty === S.fDiff) && (!S.fTag || s.tags.includes(S.fTag)));
+  if (sortBy === 'date') list.sort((a, b) => (b.recorded || '').localeCompare(a.recorded || '') || a.name.localeCompare(b.name));
+  const sortSel = h('select', { class: 'sm', onchange: () => { ls('sort', sortSel.value); render(); } }, [['name', 'Sort by name'], ['date', 'Newest first']].map(([v, l]) => h('option', { value: v, selected: sortBy === v }, l)));
   const search = h('input', { type: 'search', placeholder: 'Search name, artist, tag', value: S.q, style: 'width:100%' });
   search.oninput = () => { S.q = search.value; const pos = search.selectionStart; libraryPage(main).then(() => { const n = $('#main input[type=search]'); if (n) { n.focus(); n.setSelectionRange(pos, pos); } }); };
   const chipRow = (cur, opts, set) => h('div', { class: 'chips filters', style: 'margin-bottom:10px' }, opts.map(([v, l]) => h('span', { class: 'chip' + (cur === v ? ' on' : ''), onclick: () => { set(cur === v ? '' : v); render(); } }, l)));
@@ -111,19 +115,91 @@ async function libraryPage(main) {
         h('div', { class: 'note', style: 'margin:10px 0 4px' }, 'Source'), chipRow(S.fSrc, Object.entries(SRC), v => S.fSrc = v),
         h('div', { class: 'note', style: 'margin:0 0 4px' }, 'Difficulty'), chipRow(S.fDiff, Object.entries(DIFF).filter(([k]) => k), v => S.fDiff = v),
         tags.length ? [h('div', { class: 'note', style: 'margin:0 0 4px' }, 'Tags'), chipRow(S.fTag, tags.map(t => [t, t]), v => S.fTag = v)] : null),
-      S.user.perms.upload || S.user.admin ? h('div', { class: 'card' }, h('h2', {}, 'New session'), h('div', { class: 'row' }, nameIn, h('button', { class: 'on', onclick: add }, 'Add')),
-        h('div', { class: 'note', style: 'margin-top:8px' }, st.watch ? 'Or drop a folder of tracks into the watch folder; it becomes a session on its own.' : 'Tip: an admin can connect a watch folder so dropped folders import on their own.')) : null),
+      S.user.perms.upload || S.user.admin ? [importCard(),
+        h('div', { class: 'card' }, h('h2', {}, 'New empty session'), h('div', { class: 'row' }, nameIn, h('button', { class: 'on', onclick: add }, 'Add')),
+        h('div', { class: 'note', style: 'margin-top:8px' }, st.watch ? 'The watch folder is on too: folders dropped into it become sessions on their own.' : 'Tip: an admin can connect a watch folder so folders dropped there import on their own.'))] : null),
     h('div', { class: 'col' }, S.msg && h('div', { class: 'errbox' }, S.msg),
-      h('div', { class: 'card' }, h('h2', {}, `Sessions · ${list.length}${list.length !== S.sessions.length ? ' of ' + S.sessions.length : ''}`),
+      h('div', { class: 'card' }, h('div', { class: 'row', style: 'margin-bottom:6px' }, h('h2', { class: 'grow', style: 'margin:0' }, `Sessions · ${list.length}${list.length !== S.sessions.length ? ' of ' + S.sessions.length : ''}`), sortSel),
         !S.sessions.length ? h('div', { class: 'note' }, 'No sessions yet.') : !list.length ? h('div', { class: 'note' }, 'Nothing matches those filters.') :
-        h('div', { style: 'overflow-x:auto' }, h('table', { class: 'tr' }, h('thead', {}, h('tr', {}, ['Name', 'Source', 'Version', 'Tracks', 'Length', 'Tags', ''].map(x => h('th', {}, x)))),
+        h('div', { style: 'overflow-x:auto' }, h('table', { class: 'tr' }, h('thead', {}, h('tr', {}, ['Name', 'Date', 'Source', 'Version', 'Tracks', 'Length', 'Tags', ''].map(x => h('th', {}, x)))),
           h('tbody', {}, list.map(s => h('tr', { class: 'click', onclick: () => go('#/s/' + s.id) },
             h('td', {}, h('b', {}, s.name), s.artist && h('div', { class: 'note' }, s.artist)),
+            h('td', { class: 'num' }, s.recorded ? fmtDay(s.recorded) : '–'),
             h('td', {}, h('span', { class: 'chip' }, SRC[s.source] || s.source)),
             h('td', { class: 'num' }, s.version ? 'v' + s.version : '–', s.draft && h('span', { class: 'chip warn', style: 'margin-left:6px', title: 'Has unsaved changes' }, 'Draft')),
             h('td', { class: 'num' }, String(s.tracks)), h('td', { class: 'num' }, fmtTime(s.duration)),
             h('td', {}, h('div', { class: 'chips' }, s.difficulty && h('span', { class: 'chip teal' }, DIFF[s.difficulty]), s.tags.slice(0, 4).map(t => h('span', { class: 'chip' }, t)))),
             h('td', {}, s.restricted && h('span', { class: 'chip warn', title: 'License-restricted' }, 'Licensed')))))))))));
+}
+
+// ---- importing dropped folders as sessions ----
+function importCard() {
+  const files = h('input', { type: 'file', multiple: true, accept: 'audio/*,.zip,.wav,.aif,.aiff,.flac,.mp3,.m4a,.ogg,.opus,.caf', class: 'hide', onchange: () => importDialog(pickedFiles(files)) });
+  const dir = h('input', { type: 'file', webkitdirectory: true, multiple: true, class: 'hide', onchange: () => importDialog(pickedFiles(dir)) });
+  const drop = h('div', { class: 'drop', style: 'margin:0' }, h('b', {}, 'Drop folders of tracks here'),
+    h('div', { class: 'note' }, 'A folder of tracks, a folder of song folders, or loose files. You will see what becomes a session before anything uploads.'),
+    h('div', { class: 'row', style: 'justify-content:center;margin-top:8px' }, h('button', { class: 'sm', onclick: () => dir.click() }, 'Choose a folder…'), h('button', { class: 'sm', onclick: () => files.click() }, 'Choose files…')));
+  drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); }; drop.ondragleave = () => drop.classList.remove('over');
+  drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); droppedFiles(e.dataTransfer).then(importDialog).catch(err => { S.msg = err.message; render(); }); };
+  return h('div', { class: 'card' }, h('h2', {}, 'Import'), files, dir, drop);
+}
+function groupFiles(list, mode) {
+  const dirOf = p => p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '';
+  // "song" mode: each folder at the first level that splits (inside a single dropped folder, its subfolders), with everything below it
+  const tops0 = new Set(list.map(x => x.path.split('/')[0]));
+  const depth = tops0.size === 1 && list.every(x => x.path.split('/').length > 2) ? 2 : 1;
+  const key = p => mode === 'one' ? '*' : mode === 'top' ? (p.split('/').length > depth ? p.split('/').slice(0, depth).join('/') : dirOf(p)) : dirOf(p);
+  const groups = new Map();
+  for (const x of [...list].sort(byPath)) { const k = key(x.path); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(x); }
+  const tops = [...new Set(list.map(x => x.path.includes('/') ? x.path.split('/')[0] : ''))];
+  return [...groups].map(([k, items]) => ({ name: (k === '*' ? (tops.length === 1 && tops[0] ? tops[0] : 'Dropped tracks') : k ? k.split('/').pop() : 'Dropped tracks').replace(/[_]+/g, ' ').trim(), items }));
+}
+function importDialog(list) {
+  if (!list.length) { S.msg = 'No audio files in what you dropped'; render(); return; }
+  const d = $('#dlg'), dirs = new Set(list.map(x => x.path.includes('/') ? x.path.slice(0, x.path.lastIndexOf('/')) : ''));
+  let mode = dirs.size > 1 ? 'top' : 'one', groups = groupFiles(list, mode), busy = false, msg = '';
+  const src = h('select', {}, Object.entries(SRC).map(([v, l]) => h('option', { value: v, selected: v === 'other' }, l)));
+  const save = h('input', { type: 'checkbox', checked: true });
+  const draw = () => {
+    const size = list.reduce((n, x) => n + x.file.size, 0);
+    fill(d, h('h2', {}, 'Import'),
+      h('div', { class: 'note', style: 'margin-bottom:8px' }, `${list.length} audio files · ${fmtMB(size)}`),
+      dirs.size > 1 && h('div', { class: 'note', style: 'margin-bottom:4px' }, 'What becomes a session?'), dirs.size > 1 && h('div', { class: 'seg', style: 'margin-bottom:8px;flex-wrap:wrap' }, [['folder', 'Each folder of tracks'], ['top', 'Each song folder, subfolders included'], ['one', 'All one session']]
+        .map(([k, l]) => h('button', { class: mode === k ? 'on' : '', disabled: busy, onclick: () => { mode = k; groups = groupFiles(list, mode); draw(); } }, l))),
+      h('div', { style: 'max-height:42vh;overflow:auto;margin-bottom:8px' }, groups.map(g => {
+        const nm = h('input', { type: 'text', class: 'grow', value: g.name, disabled: busy, oninput: () => { g.name = nm.value; } });
+        const oldest = g.items.reduce((m, x) => Math.min(m, x.file.lastModified || Infinity), Infinity);
+        return h('div', { class: 'li' }, nm, h('span', { class: 'note', style: 'white-space:nowrap' }, `${g.items.length} track${g.items.length === 1 ? "" : "s"}${oldest < Infinity ? ' · ' + fmtDay(fileDate({ lastModified: oldest })) : ''}`), g.status && h('span', { class: g.err ? 'bad note' : 'ok note', style: 'white-space:nowrap' }, g.status));
+      })),
+      h('div', { class: 'row', style: 'margin-bottom:8px' }, h('span', { class: 'note' }, 'Source'), src, h('label', { class: 'row note', style: 'flex-wrap:nowrap' }, save, 'Save version 1.0.0 when the tracks have converted')),
+      busy && h('div', { class: 'bar' }, h('i', { id: 'impBar' })), msg && h('div', { class: busy ? 'note' : 'errbox', id: 'impMsg', style: 'margin-bottom:8px' }, msg),
+      h('div', { class: 'row' }, h('button', { class: 'on', disabled: busy, onclick: run }, `Import ${groups.length} session${groups.length > 1 ? 's' : ''}`), h('span', { class: 'grow' }),
+        h('button', { onclick: () => { if (busy && !confirm('Stop after the file that is uploading now?')) return; stop = true; if (!busy) d.close(); } }, busy ? 'Stop' : 'Cancel')));
+  };
+  let stop = false;
+  const run = async () => {
+    busy = true; stop = false; msg = 'Starting…'; draw();
+    const total = list.reduce((n, x) => n + x.file.size, 0); let done = 0, made = [];
+    const prog = (f, extra) => { const b = $('#impBar'); if (b) b.style.width = Math.round((done + f) / Math.max(1, total) * 100) + '%'; const m = $('#impMsg'); if (m && extra) m.textContent = extra; };
+    for (const g of groups) {
+      if (stop) break;
+      try {
+        const sObj = await api('POST', '/api/sessions', { name: g.name.trim() || 'New session', source: src.value }); made.push(sObj.id);
+        for (let i = 0; i < g.items.length && !stop; i++) {
+          const x = g.items[i];
+          await putFile(sObj.id, x.file, '', f => prog(f * x.file.size, `${g.name}: ${i + 1} of ${g.items.length} · ${x.file.name}`));
+          done += x.file.size;
+        }
+        if (save.checked && !stop) await api('POST', `/api/sessions/${sObj.id}/draft/finish`, { message: 'Imported from a dropped folder' });
+        g.status = stop ? 'stopped' : 'uploaded';
+      } catch (e) { g.status = e.message; g.err = true; }
+      draw(); prog(0);
+    }
+    busy = false; msg = groups.some(g => g.err) ? 'Some sessions had problems; see above.' : '';
+    if (!msg) { d.close(); S.msg = ''; if (made.length === 1) go('#/s/' + made[0] + '/draft'); else render(); } else draw();
+  };
+  d.onclose = () => { stop = true; };
+  draw(); d.showModal();
 }
 
 // =====================================================================================
@@ -178,14 +254,15 @@ async function sessionPage(main, sid, view) {
 const field = (label, el) => h('label', { class: 'field' }, h('span', {}, label), el);
 function infoCard(s) {
   if (!s.can.edit) return h('div', { class: 'card' }, h('h2', {}, 'Session'),
-    [['Artist', s.artist], ['Source', SRC[s.source] + (s.sourceNote ? ' · ' + s.sourceNote : '')], ['Tempo', s.bpm && s.bpm + ' BPM'], ['Key', s.key], ['Added', fmtDate(s.created) + ' by ' + (s.names[s.createdBy] || '')]]
+    [['Artist', s.artist], ['Recorded', s.recorded && fmtDay(s.recorded)], ['Source', SRC[s.source] + (s.sourceNote ? ' · ' + s.sourceNote : '')], ['Tempo', s.bpm && s.bpm + ' BPM'], ['Key', s.key], ['Added', fmtDate(s.created) + ' by ' + (s.names[s.createdBy] || '')]]
       .map(([k, v]) => h('div', { class: 'stat' }, h('span', { class: 'note' }, k), h('span', {}, v || '–'))));
   const save = body => act(async () => { S.s = { ...(await api('PATCH', '/api/sessions/' + s.id, body)), names: S.s.names }; }, true);
   const inp = (k, ph) => { const el = h('input', { type: 'text', value: s[k] || '', placeholder: ph || '' }); el.onchange = () => save({ [k]: el.value }); return el; };
+  const rec = h('input', { type: 'date', value: s.recorded || '' }); rec.onchange = () => save({ recorded: rec.value });
   const src = h('select', { onchange: () => save({ source: src.value }) }, Object.entries(SRC).map(([v, l]) => h('option', { value: v, selected: s.source === v }, l)));
   return h('div', { class: 'card' }, h('h2', {}, 'Session'), field('Name', inp('name')), field('Artist', inp('artist')),
     h('div', { class: 'two' }, field('Tempo (BPM)', inp('bpm')), field('Key', inp('key'))),
-    field('Source', src), field('Source details', inp('sourceNote', 'e.g. Sunday 9:30 service, MultiTracks.com')),
+    field(s.recordedAuto !== false && s.recorded ? 'Recorded (from the oldest file)' : 'Recorded', rec), field('Source', src), field('Source details', inp('sourceNote', 'e.g. Sunday 9:30 service, MultiTracks.com')),
     h('div', { class: 'note' }, `Added ${fmtDate(s.created)} by ${s.names[s.createdBy] || ''}`));
 }
 function trainingCard(s) {
@@ -222,15 +299,17 @@ function tracksSection(s, view, tracks, editing) {
   const sid = s.id, kids = [];
   if (editing) {
     const d = s.draft, latest = s.versions[s.versions.length - 1];
-    const file = h('input', { type: 'file', multiple: true, accept: 'audio/*,.zip,.wav,.aif,.aiff,.flac,.mp3,.m4a,.ogg,.opus,.caf', class: 'hide', onchange: () => file.files.length && upload(file.files) });
-    const drop = h('div', { class: 'drop', onclick: () => file.click() }, h('b', {}, 'Drop multitrack files here'),
-      h('div', { class: 'note', id: 'upTxt' }, S.up || 'or click to choose. WAV, AIFF, FLAC, MP3, M4A, or a zip of the whole session. Everything is stored as 96 kHz / 24-bit WAV; files with more than two channels are split into one track per channel.'));
+    const file = h('input', { type: 'file', multiple: true, accept: 'audio/*,.zip,.wav,.aif,.aiff,.flac,.mp3,.m4a,.ogg,.opus,.caf', class: 'hide', onchange: () => file.files.length && upload(pickedFiles(file).map(x => x.file)) });
+    const dir = h('input', { type: 'file', webkitdirectory: true, multiple: true, class: 'hide', onchange: () => { const l = pickedFiles(dir).sort(byPath); l.length ? upload(l.map(x => x.file)) : (S.msg = 'No audio files in that folder', render()); } });
+    const drop = h('div', { class: 'drop', onclick: () => file.click() }, h('b', {}, 'Drop tracks or a folder of tracks here'),
+      h('div', { class: 'note', id: 'upTxt' }, S.up || 'or click to choose files. WAV, AIFF, FLAC, MP3, M4A, or a zip of the whole session; folders inside a dropped folder are included. Everything is stored as 96 kHz / 24-bit WAV; files with more than two channels are split into one track per channel.'),
+      h('button', { class: 'sm', style: 'margin-top:8px', onclick: e => { e.stopPropagation(); dir.click(); } }, 'Choose a folder…'));
     drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); }; drop.ondragleave = () => drop.classList.remove('over');
-    drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); e.dataTransfer.files.length && upload(e.dataTransfer.files); };
+    drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); droppedFiles(e.dataTransfer).then(l => l.length ? upload(l.sort(byPath).map(x => x.file)) : (S.msg = 'No audio files in what you dropped', render())); };
     const msg = h('input', { type: 'text', class: 'grow', placeholder: latest ? 'What changed? (shown in the history)' : 'Notes for the first version (optional)' });
     const notReady = d && d.tracks.some(t => t.status !== 'ready');
     const next = bump(latest && latest.v, S.bump);
-    kids.push(file, drop, h('div', { class: 'draft' },
+    kids.push(file, dir, drop, h('div', { class: 'draft' },
       h('div', { class: 'row' }, h('b', {}, d ? (d.restoredFrom ? `Restored from v${d.restoredFrom}` : latest ? `Unsaved changes on v${d.base || latest.v}` : 'New session, not saved yet') : 'Editing: changes become a new version'),
         d && d.by && h('span', { class: 'note' }, 'by ' + (s.names[d.by] || ''))),
       h('div', { class: 'row', style: 'margin-top:8px' },
@@ -267,19 +346,43 @@ function tracksSection(s, view, tracks, editing) {
   function patchT(t, body) { act(async () => { S.s = await api('PATCH', `/api/sessions/${sid}/draft/tracks/${t.id}`, body); if (route().b !== 'draft') go(`#/s/${sid}/draft`); }); }
   function move(i, d) { const ids = tracks.map(t => t.id), j = i + d; [ids[i], ids[j]] = [ids[j], ids[i]]; act(async () => { S.s = await api('PATCH', `/api/sessions/${sid}/draft`, { order: ids }); }); }
 }
+// ---- files and folders from a drop or a picker ----
+const AUDIO_RE = /\.(wav|wave|bwf|aiff?|flac|mp3|m4a|aac|ogg|opus|wma|caf|zip)$/i;
+const keepFile = name => AUDIO_RE.test(name) && !name.startsWith('.') && !name.startsWith('._');
+const fileDate = f => { const d = new Date(f.lastModified || Date.now()); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+// Everything dropped, folders included, as [{ path: 'Folder/Sub/file.wav', file }]. Must start inside the drop event.
+function droppedFiles(dt) {
+  const entries = [...(dt.items || [])].map(i => i.webkitGetAsEntry ? i.webkitGetAsEntry() : null).filter(Boolean);
+  if (!entries.length) return Promise.resolve([...dt.files].filter(f => keepFile(f.name)).map(f => ({ path: f.name, file: f })));
+  const out = [];
+  const readAll = dir => new Promise((resolve, reject) => { const r = dir.createReader(), all = []; const next = () => r.readEntries(b => { if (!b.length) resolve(all); else { all.push(...b); next(); } }, reject); next(); });
+  const walk = async (e, prefix) => {
+    if (e.name.startsWith('.') || e.name === '__MACOSX') return;
+    if (e.isFile) { if (keepFile(e.name)) out.push({ path: prefix + e.name, file: await new Promise((res, rej) => e.file(res, rej)) }); }
+    else if (e.isDirectory) for (const c of await readAll(e)) await walk(c, prefix + e.name + '/');
+  };
+  return Promise.all(entries.map(e => walk(e, ''))).then(() => out);
+}
+const pickedFiles = input => [...input.files].filter(f => keepFile(f.name)).map(f => ({ path: f.webkitRelativePath || f.name, file: f }));
+const byPath = (a, b) => a.path.localeCompare(b.path, undefined, { numeric: true, sensitivity: 'base' });
+// Upload one file into a session's unsaved changes; resolves with the session.
+function putFile(sid, file, extra, onprog) {
+  return new Promise((resolve, reject) => {
+    const x = new XMLHttpRequest();
+    x.open('PUT', `/api/sessions/${sid}/upload?name=${encodeURIComponent(file.name)}&date=${fileDate(file)}${extra || ''}`);
+    x.setRequestHeader('x-livevault', '1');
+    x.upload.onprogress = e => onprog && onprog(e.loaded / Math.max(1, e.total));
+    x.onload = () => { if (x.status === 200) resolve(JSON.parse(x.responseText)); else { let m = 'Upload failed'; try { m = JSON.parse(x.responseText).error || m; } catch {} reject(new Error(m)); } };
+    x.onerror = () => reject(new Error('Upload failed: connection lost'));
+    x.send(file);
+  });
+}
+
 function upload(files, replace) {
   const list = [...files], sid = S.s.id;
   act(async () => {
     for (let i = 0; i < list.length; i++) {
-      await new Promise((resolve, reject) => {
-        const x = new XMLHttpRequest();
-        x.open('PUT', `/api/sessions/${sid}/upload?name=${encodeURIComponent(list[i].name)}${replace ? '&replace=' + replace : ''}`);
-        x.setRequestHeader('x-livevault', '1');
-        x.upload.onprogress = e => { S.up = `Uploading ${i + 1} of ${list.length}: ${list[i].name} (${Math.round(e.loaded / e.total * 100)}%)`; const el = $('#upTxt'); if (el) el.textContent = S.up; };
-        x.onload = () => { if (x.status === 200) { S.s = { ...JSON.parse(x.responseText) }; resolve(); } else reject(new Error((JSON.parse(x.responseText || '{}').error) || 'Upload failed')); };
-        x.onerror = () => reject(new Error('Upload failed: connection lost'));
-        x.send(list[i]);
-      }).finally(() => { S.up = ''; });
+      S.s = await putFile(sid, list[i], replace ? '&replace=' + replace : '', f => { S.up = `Uploading ${i + 1} of ${list.length}: ${list[i].name} (${Math.round(f * 100)}%)`; const el = $('#upTxt'); if (el) el.textContent = S.up; }).finally(() => { S.up = ''; });
       render();
     }
     if (route().b !== 'draft') go(`#/s/${sid}/draft`);
