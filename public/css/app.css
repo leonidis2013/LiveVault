@@ -77,6 +77,10 @@ main { flex:1; overflow:auto; padding:14px; }
 .col { display:flex; flex-direction:column; gap:12px; min-width:0; }
 .login { max-width:380px; margin:8vh auto 0; }
 .login input { width:100%; margin-bottom:8px; }
+.login .pwrow { display:flex; gap:6px; align-items:center; margin-bottom:8px; } .login .pwrow input { margin:0; flex:1; }
+/* phones: 16 px text in fields stops iOS from zooming in, and the page scrolls when the keyboard opens */
+@media (pointer:coarse) { input, select, textarea { font-size:16px; } }
+@media (max-width:600px) { .login { margin-top:3vh; } main { padding:10px; } }
 .field { display:flex; flex-direction:column; gap:3px; margin-bottom:8px; }
 .field > span { font-size:10.5px; color:var(--dim); letter-spacing:.06em; text-transform:uppercase; font-weight:600; }
 .field input, .field select, .field textarea { width:100%; }

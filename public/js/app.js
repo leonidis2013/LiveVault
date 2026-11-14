@@ -71,19 +71,23 @@ function status(busy) {
 // =====================================================================================
 function loginPage() {
   const setup = S.st && S.st.needsSetup;
-  const un = h('input', { type: 'text', placeholder: 'User name', autocomplete: 'username' }), dn = h('input', { type: 'text', placeholder: 'Display name (shown to others)' });
-  const pw = h('input', { type: 'password', placeholder: 'Password', autocomplete: setup ? 'new-password' : 'current-password' });
-  const err = h('div', { class: 'errbox hide' });
-  const submit = async () => {
-    try {
-      const j = await api('POST', setup ? '/api/setup' : '/api/login', { username: un.value, password: pw.value, display: dn.value });
-      S.user = j.user; S.st = await api('GET', '/api/state'); render();
-    } catch (e) { err.textContent = e.message; err.classList.remove('hide'); }
-  };
-  pw.onkeydown = e => e.key === 'Enter' && submit();
-  return h('div', { class: 'login card' }, h('h2', {}, setup ? 'Set up LiveVault' : 'Sign in'),
+  // A real <form> with named fields, so phone password managers and keyboards (iOS "strong password", Android autofill) behave.
+  const un = h('input', { type: 'text', name: 'username', id: 'lv-user', placeholder: 'User name', autocomplete: 'username', autocapitalize: 'none', autocorrect: 'off', spellcheck: false, required: true });
+  const dn = h('input', { type: 'text', name: 'display', placeholder: 'Display name (shown to others)', autocomplete: 'name' });
+  const pw = h('input', { type: 'password', name: 'password', id: 'lv-pass', placeholder: setup ? 'Password (8+ characters)' : 'Password', autocomplete: setup ? 'new-password' : 'current-password', autocapitalize: 'none', autocorrect: 'off', spellcheck: false, required: true });
+  const show = h('button', { type: 'button', class: 'sm', onclick: () => { pw.type = pw.type === 'password' ? 'text' : 'password'; show.textContent = pw.type === 'password' ? 'Show' : 'Hide'; pw.focus(); } }, 'Show');
+  const err = h('div', { class: 'errbox hide' }), go = h('button', { type: 'submit', class: 'on grow' }, setup ? 'Create admin account' : 'Sign in');
+  const form = h('form', { class: 'login card', method: 'post', action: '#', autocomplete: 'on' }, h('h2', {}, setup ? 'Set up LiveVault' : 'Sign in'),
     setup && h('div', { class: 'note', style: 'margin-bottom:10px' }, 'Create the first account. It is an admin and can add everyone else under Users.'),
-    un, setup && dn, pw, h('div', { class: 'row' }, h('button', { class: 'on grow', onclick: submit }, setup ? 'Create admin account' : 'Sign in')), h('div', { style: 'margin-top:8px' }, err));
+    un, setup && dn, h('div', { class: 'pwrow' }, pw, show), h('div', { class: 'row' }, go), h('div', { style: 'margin-top:8px' }, err));
+  form.onsubmit = async e => {
+    e.preventDefault(); go.disabled = true; err.classList.add('hide');
+    try {
+      const j = await api('POST', setup ? '/api/setup' : '/api/login', { username: un.value.trim(), password: pw.value, display: dn.value });
+      S.user = j.user; S.st = await api('GET', '/api/state'); render();
+    } catch (ex) { err.textContent = ex.message; err.classList.remove('hide'); go.disabled = false; }
+  };
+  return form;
 }
 
 // =====================================================================================
