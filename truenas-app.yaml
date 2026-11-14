@@ -5,6 +5,8 @@
 services:
   livevault:
     image: ghcr.io/leonidis2013/livevault:latest
+    # check for a newer image every time the app starts or restarts
+    pull_policy: always
     container_name: livevault
     restart: unless-stopped
     ports:
