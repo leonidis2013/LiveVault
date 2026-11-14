@@ -104,7 +104,7 @@ async function libraryPage(main) {
   const chipRow = (cur, opts, set) => h('div', { class: 'chips filters', style: 'margin-bottom:10px' }, opts.map(([v, l]) => h('span', { class: 'chip' + (cur === v ? ' on' : ''), onclick: () => { set(cur === v ? '' : v); render(); } }, l)));
   const nameIn = h('input', { type: 'text', placeholder: 'New session name', class: 'grow' });
   const add = () => nameIn.value.trim() && act(async () => { const s = await api('POST', '/api/sessions', { name: nameIn.value.trim() }); go('#/s/' + s.id + '/draft'); }, false);
-  nameIn.onkeydown = e => e.key === 'Enter' && add();
+  nameIn.onkeydown = e => { if (e.key === 'Enter') add(); };   // a handler that returns false would cancel every key
   fill(main, h('div', { class: 'page' },
     h('div', { class: 'col' },
       h('div', { class: 'card' }, h('h2', {}, 'Find'), search,
