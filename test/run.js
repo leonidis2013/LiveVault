@@ -25,8 +25,8 @@ async function untilReady(A, sid) { for (let i = 0; i < 200; i++) { const s = (a
 (async () => {
   for (const f of ['server.js']) assert.strictEqual(spawnSync(process.execPath, ['--check', path.join(root, f)]).status, 0, f + ' has a syntax error');
   for (const f of fs.readdirSync(path.join(root, 'public/js'))) { const t = path.join(data, f.replace('.js', '.mjs')); fs.writeFileSync(t, fs.readFileSync(path.join(root, 'public/js', f))); assert.strictEqual(spawnSync(process.execPath, ['--check', t]).status, 0, f + ' has a syntax error'); }
-  fs.mkdirSync(watch);
-  const srv = spawn(process.execPath, [path.join(root, 'server.js')], { env: { ...process.env, DATA_DIR: path.join(data, 'd'), WATCH_DIR: watch, WATCH_SCAN_MS: '300', PORT: port, HTTPS_PORT: '0' }, stdio: 'inherit' });
+  fs.mkdirSync(watch); const lib = path.join(data, 'lib'); fs.mkdirSync(lib);
+  const srv = spawn(process.execPath, [path.join(root, 'server.js')], { env: { ...process.env, DATA_DIR: path.join(data, 'd'), LIBRARY_DIR: lib, WATCH_DIR: watch, WATCH_SCAN_MS: '300', PORT: port, HTTPS_PORT: '0' }, stdio: 'inherit' });
   try {
     for (let i = 0; i < 50; i++) { try { await fetch(base + '/api/state'); break; } catch { await sleep(100); } }
     const A = client(), T = client(), anon = client();
@@ -65,7 +65,7 @@ async function untilReady(A, sid) { for (let i = 0; i < 200; i++) { const s = (a
       assert.deepStrictEqual(ts.map(t => t.name), ['Kick', 'Keys', 'Drums 1', 'Drums 2', 'Drums 3', 'Drums 4', 'Full Mix']);
       assert.strictEqual(ts[6].kind, 'reference');
       assert.strictEqual(ts[0].channels, 1); assert.strictEqual(ts[1].channels, 2); assert.ok(ts[0].origHash, '48 kHz original kept'); assert.strictEqual(ts[1].origHash, null, '96 kHz WAV needs no original');
-      const st = JSON.parse(spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=sample_rate,bits_per_sample', '-of', 'json', path.join(data, 'd', 'blobs', ts[0].hash.slice(0, 2), ts[0].hash + '.wav')]).stdout).streams[0];
+      const st = JSON.parse(spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=sample_rate,bits_per_sample', '-of', 'json', path.join(lib, '.livevault', 'blobs', ts[0].hash.slice(0, 2), ts[0].hash + '.wav')]).stdout).streams[0];
       assert.strictEqual(+st.sample_rate, 96000); assert.strictEqual(+st.bits_per_sample, 24);
       // same file again: stored once, same hash
       r = await A('PUT', `/api/sessions/${sid}/upload?name=Kick copy.wav&date=2020-01-01`, tone(60, 48000, 1)); s = await untilReady(A, sid);
@@ -154,13 +154,28 @@ async function untilReady(A, sid) { for (let i = 0; i < 200; i++) { const s = (a
       for (let i = 0; i < 20 && fs.existsSync(wd); i++) await sleep(100);
       assert.ok(!fs.existsSync(wd) && fs.readdirSync(path.join(watch, '_imported')).length === 1, 'imported folder moved aside');
 
-      r = await A('GET', '/api/storage'); assert.ok(r.body.audio > 0);
+      // readable library folders on the drive: one folder per version, hard links to the single stored copy
+      await sleep(1500);
+      const sdir = path.join(lib, 'Goodness of God (2025-12-24)');
+      assert.ok(fs.existsSync(sdir), 'session folder: ' + fs.readdirSync(lib).join(', '));
+      assert.deepStrictEqual(fs.readdirSync(sdir).filter(f => !f.startsWith('.')).sort(), ['Mixes', 'Recordings', 'v1.0.0', 'v1.0.1', 'v2.0.0']);
+      const v100 = fs.readdirSync(path.join(sdir, 'v1.0.0')).sort();
+      assert.deepStrictEqual(v100, ['01 Kick.wav', '02 Keys.wav', '03 Drums 1.wav', '04 Drums 2.wav', '05 Drums 3.wav', '06 Drums 4.wav', 'REF Full Mix.wav']);
+      assert.strictEqual(fs.statSync(path.join(sdir, 'v1.0.0', '03 Drums 1.wav')).ino, fs.statSync(path.join(sdir, 'v1.0.1', '03 Drums 1.wav')).ino, 'unchanged tracks are the same file');
+      assert.ok(fs.existsSync(path.join(sdir, 'v1.0.1', '01 Piano.wav')));
+      assert.ok(fs.readdirSync(path.join(sdir, 'Recordings'))[0].endsWith('Run 1 (v1.0.1).wav'));
+      assert.strictEqual(JSON.parse(fs.readFileSync(path.join(sdir, 'Mixes', "Trainee's mix (v1.0.1).json"))).mix.current.x, 2);
+      assert.ok(fs.existsSync(path.join(lib, 'Sunday 11-09 (' + ws.recorded + ')', 'v1.0.0')), 'watch import has a folder');
+      await A('PATCH', '/api/sessions/' + sid, { name: 'Goodness of God (Bethel)' }); await sleep(1500);
+      assert.ok(!fs.existsSync(sdir) && fs.existsSync(path.join(lib, 'Goodness of God (Bethel) (2025-12-24)', 'v2.0.0')), 'folder follows a rename');
+      r = await A('GET', '/api/storage'); assert.ok(r.body.audio > 0); assert.strictEqual(r.body.library.path, lib);
       r = await A('POST', '/api/storage/cleanup'); assert.strictEqual(r.status, 200);
       assert.strictEqual((await A('GET', `/api/sessions/${sid}/files/${h}`)).status, 200, 'cleanup keeps audio that versions use');
     } else console.log('ffmpeg not installed here: skipped the audio tests');
 
     assert.strictEqual((await T('DELETE', '/api/sessions/' + sid)).status, hasFfmpeg ? 401 : 403, hasFfmpeg ? 'disabled user is signed out' : 'trainee cannot delete');
     r = await A('DELETE', '/api/sessions/' + sid); assert.strictEqual(r.status, 200);
+    await sleep(1200); assert.ok(!fs.readdirSync(lib).some(f => f.startsWith('Goodness')), 'deleting a session removes its folder');
     assert.strictEqual((await A('GET', '/api/sessions/' + sid)).status, 404);
     console.log('ok');
   } finally { srv.kill(); fs.rmSync(data, { recursive: true, force: true }); }

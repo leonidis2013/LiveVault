@@ -23,6 +23,37 @@ const MAX_UPLOAD = +(process.env.MAX_UPLOAD_MB || 8192) * 1024 * 1024;
 const RATE = 96000;
 const D = { sessions: path.join(DATA, 'sessions'), mixes: path.join(DATA, 'mixes'), blobs: path.join(DATA, 'blobs'), orig: path.join(DATA, 'originals'),
   prev: path.join(DATA, 'previews'), raw: path.join(DATA, 'raw'), recs: path.join(DATA, 'recordings'), inc: path.join(DATA, 'incoming'), tmp: path.join(DATA, 'tmp') };
+// Mixed storage: when a dataset is mounted at /library, the audio (tracks and Main LR recordings) lives there, with
+// readable folders per session that you can browse over SMB. Everything else stays in the /data volume.
+const LIB = path.resolve(process.env.LIBRARY_DIR || '/library');
+let libErr = '';
+const libOn = (() => {
+  try { if (!fs.statSync(LIB).isDirectory()) return false; } catch { return false; }
+  try { fs.accessSync(LIB, fs.constants.W_OK); fs.mkdirSync(path.join(LIB, '.livevault'), { recursive: true }); return true; }
+  catch (e) { libErr = `LiveVault cannot write to the library dataset (${e.code}). Give user ID 1000 Modify permission on it, then restart the app. Audio stays in the volume until then.`; console.error(libErr); return false; }
+})();
+if (libOn) {
+  const store = path.join(LIB, '.livevault');
+  for (const [k, sub] of [['blobs', 'blobs'], ['recs', 'recordings']]) {
+    const from = D[k], to = path.join(store, sub);
+    D[k] = to; fs.mkdirSync(to, { recursive: true });
+    moveTreeSync(from, to);   // one-time move from the volume to the drive
+  }
+}
+function moveTreeSync(from, to) {
+  let n = 0;
+  const walk = (a, b) => {
+    for (const e of (() => { try { return fs.readdirSync(a, { withFileTypes: true }); } catch { return []; } })()) {
+      const pa = path.join(a, e.name), pb = path.join(b, e.name);
+      if (e.isDirectory()) { fs.mkdirSync(pb, { recursive: true }); walk(pa, pb); try { fs.rmdirSync(pa); } catch {} continue; }
+      if (fs.existsSync(pb)) { fs.unlinkSync(pa); continue; }
+      try { fs.renameSync(pa, pb); } catch { fs.copyFileSync(pa, pb); fs.unlinkSync(pa); }
+      if (++n % 200 === 0) console.log(`moving audio to ${to}: ${n} files so far`);
+    }
+  };
+  walk(from, to);
+  if (n) console.log(`moved ${n} files to ${to}`);
+}
 for (const d of Object.values(D)) fs.mkdirSync(d, { recursive: true });
 const AUDIO_EXT = new Set(['.wav', '.wave', '.bwf', '.aif', '.aiff', '.flac', '.mp3', '.m4a', '.aac', '.ogg', '.opus', '.wma', '.caf']);
 const PERMS = ['upload', 'edit', 'delete', 'download', 'mix', 'seeMixes', 'licensed'];
@@ -148,7 +179,7 @@ function withSession(sid, fn) {
   const next = prev.catch(() => {}).then(async () => {
     const cur = sessions.get(sid); if (!cur) throw httpErr(404, 'Session not found');
     const s = clone(cur); const r = await fn(s);
-    if (r !== false) { s.updated = now(); await writeJson(path.join(D.sessions, sid + '.json'), s); sessions.set(sid, s); }
+    if (r !== false) { s.updated = now(); await writeJson(path.join(D.sessions, sid + '.json'), s); sessions.set(sid, s); scheduleMirror(sid); }
     return s;
   });
   sesLocks.set(sid, next);
@@ -272,7 +303,7 @@ async function ingestFile(file, origName, workDir) {
     await toWav96(file, out, c);
     const h = await hashFile(out), ch = c == null ? Math.min(pr.channels, 2) : 1;
     const dst = blobPath(h);
-    if (await exists(dst)) await fsp.unlink(out); else await moveFile(out, dst);
+    if (await exists(dst)) await fsp.unlink(out); else { await moveFile(out, dst); await fsp.chmod(dst, 0o444).catch(() => {}); }
     const size = (await fsp.stat(dst)).size, duration = pr.duration || size / (RATE * 3 * ch);
     await writeJson(shard(D.blobs, h, '.json'), { channels: ch, duration, size });
     await makePreview(h);
@@ -459,6 +490,7 @@ async function listMixes(sid) {
 }
 const mixVisible = (u, m) => u.admin || can(u, 'seeMixes') || m.by === u.id || m.reference;
 async function saveMix(s, u, b, version) {
+  scheduleMirror(s.id);
   if (!b.data || typeof b.data !== 'object') throw httpErr(400, 'No mix data');
   const raw = JSON.stringify(b.data); if (raw.length > 4e6) throw httpErr(413, 'Mix is too large');
   await fsp.mkdir(mixDir(s.id), { recursive: true });
@@ -478,10 +510,11 @@ async function listRecordings(sid) {
   return out.sort((a, b) => b.created - a.created);
 }
 async function addRecording(req, s, u, version, q) {
+  scheduleMirror(s.id);
   const rid = id(4), dir = recDir(s.id), wav = path.join(dir, rid + '.wav');
   await fsp.mkdir(dir, { recursive: true });
   try {
-    await streamTo(req, wav + '.part'); await fsp.rename(wav + '.part', wav);
+    await streamTo(req, wav + '.part'); await fsp.rename(wav + '.part', wav); await fsp.chmod(wav, 0o444).catch(() => {});
     const pr = await probe(wav);
     await renderPreview(wav, path.join(dir, rid + '.opus'), path.join(dir, rid + '.peaks.json'), pr.channels > 1 ? 2 : 1);
     let mixName = '';
@@ -534,6 +567,70 @@ async function listMixesFull(sid) {
   const out = [];
   for (const f of await fsp.readdir(mixDir(sid)).catch(() => [])) if (f.endsWith('.json')) { const m = await readJson(path.join(mixDir(sid), f), null); if (m) out.push(m); }
   return out;
+}
+
+// ---------- readable library folders on the drive ----------
+// <Session> (<date>)/v1.0.0/01 Kick.wav … hard links to the one stored copy, so versions cost no extra space.
+// Recordings/ and Mixes/ hold the Main LR takes and the mix settings. LiveVault owns these folders and rewrites them.
+const MARK = '.livevault-session', mirrorDirs = new Map(), mirrorTimers = new Map();
+const safeName = n => String(n || '').replace(/[\/\\:*?"<>|\x00-\x1f]/g, '-').replace(/^[.\s]+/, '').replace(/\s+/g, ' ').trim().slice(0, 100) || 'Untitled';
+if (libOn) for (const e of fs.readdirSync(LIB, { withFileTypes: true })) {
+  if (!e.isDirectory() || e.name.startsWith('.')) continue;
+  try { const sid = fs.readFileSync(path.join(LIB, e.name, MARK), 'utf8').trim(); if (okId(sid)) mirrorDirs.set(sid, e.name); } catch {}
+}
+function scheduleMirror(sid) {
+  if (!libOn) return;
+  clearTimeout(mirrorTimers.get(sid));
+  mirrorTimers.set(sid, setTimeout(() => { mirrorTimers.delete(sid); syncMirror(sid).catch(e => console.error('library folder', sid, e.message)); }, 800));
+}
+async function linkInto(target, dest) {
+  try { await fsp.link(target, dest); }
+  catch (e) { if (e.code === 'EEXIST') return; await fsp.symlink(path.relative(path.dirname(dest), target), dest); }   // different file system: a relative link instead
+}
+async function syncMirror(sid) {
+  const s = sessions.get(sid), old = mirrorDirs.get(sid);
+  if (!s) { if (old) { await fsp.rm(path.join(LIB, old), { recursive: true, force: true }); mirrorDirs.delete(sid); } return; }
+  // what the folder should hold
+  const want = new Map(), uniq = (dir, base, ext) => { let p = `${dir}/${base}${ext}`, n = 2; while (want.has(p)) p = `${dir}/${base} (${n++})${ext}`; return p; };
+  for (const v of s.versions) {
+    let no = 0;
+    for (const t of v.tracks) {
+      const label = t.kind === 'reference' ? 'REF' : t.kind === 'off' ? 'Unused' : String(++no).padStart(2, '0');
+      want.set(uniq('v' + v.v, `${label} ${safeName(t.name)}`, '.wav'), { link: blobPath(t.hash) });
+    }
+  }
+  for (const r of await listRecordings(sid)) want.set(uniq('Recordings', `${localDate(r.created)} ${safeName(r.name)} (v${r.version})`, '.wav'), { link: path.join(recDir(sid), r.id + '.wav') });
+  for (const m of await listMixesFull(sid)) want.set(uniq('Mixes', `${safeName(m.name)} (v${m.version})`, '.json'),
+    { text: JSON.stringify({ name: m.name, by: m.byName, version: m.version, reference: m.reference, updated: new Date(m.updated).toISOString(), mix: m.data }, null, 2) });
+  if (!want.size) { if (old) { await fsp.rm(path.join(LIB, old), { recursive: true, force: true }); mirrorDirs.delete(sid); } return; }   // nothing saved yet
+  // its folder name follows the session name and date
+  let name = safeName(s.name) + (okDate(s.recorded) ? ` (${s.recorded})` : '');
+  if ([...mirrorDirs].some(([x, n]) => x !== sid && n.toLowerCase() === name.toLowerCase())) name += ` [${sid}]`;
+  if (old && old !== name) { await fsp.rename(path.join(LIB, old), path.join(LIB, name)).catch(async () => { await fsp.rm(path.join(LIB, old), { recursive: true, force: true }); }); }
+  const root = path.join(LIB, name); mirrorDirs.set(sid, name);
+  await fsp.mkdir(root, { recursive: true }); await fsp.writeFile(path.join(root, MARK), sid);
+  // remove what should not be there, add or fix what should
+  const have = new Set();
+  for (const d of await fsp.readdir(root, { withFileTypes: true })) {
+    if (!d.isDirectory() || !(/^v\d+\.\d+\.\d+$/.test(d.name) || d.name === 'Recordings' || d.name === 'Mixes')) continue;
+    for (const f of await fsp.readdir(path.join(root, d.name))) { const rel = `${d.name}/${f}`; if (want.has(rel)) have.add(rel); else await fsp.rm(path.join(root, rel), { recursive: true, force: true }); }
+    if (!(await fsp.readdir(path.join(root, d.name))).length) await fsp.rmdir(path.join(root, d.name)).catch(() => {});
+  }
+  for (const [rel, w] of want) {
+    const dest = path.join(root, rel);
+    await fsp.mkdir(path.dirname(dest), { recursive: true });
+    if (w.link) {
+      const [a, b] = await Promise.all([fsp.stat(w.link).catch(() => null), have.has(rel) ? fsp.stat(dest).catch(() => null) : null]);
+      if (!a) continue;
+      if (b && b.ino === a.ino && b.dev === a.dev) continue;
+      if (have.has(rel)) await fsp.rm(dest, { force: true });
+      await linkInto(w.link, dest);
+    } else if (!have.has(rel) || (await fsp.readFile(dest, 'utf8').catch(() => '')) !== w.text) await fsp.writeFile(dest, w.text);
+  }
+}
+async function syncAllMirrors() {
+  for (const sid of sessions.keys()) await syncMirror(sid).catch(e => console.error('library folder', sid, e.message));
+  for (const sid of [...mirrorDirs.keys()]) if (!sessions.has(sid)) await syncMirror(sid).catch(() => {});
 }
 
 // ---------- files with Range support ----------
@@ -739,8 +836,10 @@ async function handle(req, res) {
     if (m === 'GET') {
       const fsInfo = await fsp.statfs(DATA).catch(() => null);
       return send(res, 200, { audio: await dirSize(D.blobs), originals: await dirSize(D.orig), previews: await dirSize(D.prev) + await dirSize(path.join(DATA, 'mixer')), mixes: await dirSize(D.mixes), recordings: await dirSize(D.recs),
-        free: fsInfo ? fsInfo.bavail * fsInfo.bsize : null, sessions: sessions.size, busy: running + queue.length });
+        free: fsInfo ? fsInfo.bavail * fsInfo.bsize : null, sessions: sessions.size, busy: running + queue.length,
+        library: libOn ? { path: LIB, free: await fsp.statfs(LIB).then(x => x.bavail * x.bsize).catch(() => null) } : null, libraryError: libErr });
     }
+    if (seg[2] === 'library' && m === 'POST') { if (!libOn) return send(res, 400, { error: 'No library dataset is mounted at /library' }); await syncAllMirrors(); return send(res, 200, { ok: true, folders: mirrorDirs.size }); }
     if (seg[2] === 'cleanup' && m === 'POST') { if (running + queue.length) return send(res, 400, { error: 'Wait until all tracks have finished converting' }); return send(res, 200, await cleanup()); }
   }
 
@@ -759,7 +858,7 @@ async function handle(req, res) {
       if (m === 'PATCH') { need('edit'); const b = await readBody(req); return send(res, 200, sessionOut(u, await withSession(sid, x => applyMeta(x, b)))); }
       if (m === 'DELETE') {
         need('delete');
-        await withSession(sid, () => false); sessions.delete(sid);
+        await withSession(sid, () => false); sessions.delete(sid); scheduleMirror(sid);
         await fsp.rm(path.join(D.sessions, sid + '.json'), { force: true }); await fsp.rm(mixDir(sid), { recursive: true, force: true }); await fsp.rm(recDir(sid), { recursive: true, force: true });
         return send(res, 200, { ok: true });
       }
@@ -843,11 +942,12 @@ async function handle(req, res) {
         const b = await readBody(req);
         if (typeof b.name === 'string' && b.name.trim()) { if (r.by !== u.id && !u.admin) return send(res, 403, { error: 'Only the owner can rename a recording' }); r.name = str(b.name, 80); }
         if (typeof b.notes === 'string') { need('edit'); r.notes = b.notes.slice(0, 20000); r.notesBy = u.id; r.notesByName = u.display; r.notesAt = now(); }
-        await writeJson(f, r); return send(res, 200, r);
+        await writeJson(f, r); scheduleMirror(sid); return send(res, 200, r);
       }
       if (m === 'DELETE') {
         if (r.by !== u.id && !can(u, 'delete')) return send(res, 403, { error: 'You can only delete your own recordings' });
         for (const x of ['.json', '.wav', '.opus', '.peaks.json']) await fsp.rm(path.join(recDir(sid), r.id + x), { force: true });
+        scheduleMirror(sid);
         return send(res, 200, { ok: true });
       }
     }
@@ -861,9 +961,9 @@ async function handle(req, res) {
         const b = await readBody(req);
         if (typeof b.name === 'string' && b.name.trim()) { if (mm.by !== u.id && !u.admin) return send(res, 403, { error: 'Only the owner can rename a mix' }); mm.name = str(b.name, 80); }
         if (typeof b.reference === 'boolean') { need('edit'); mm.reference = b.reference; }
-        await writeJson(f, mm); delete mm.data; return send(res, 200, mm);
+        await writeJson(f, mm); delete mm.data; scheduleMirror(sid); return send(res, 200, mm);
       }
-      if (m === 'DELETE') { if (mm.by !== u.id && !can(u, 'delete')) return send(res, 403, { error: 'You can only delete your own mixes' }); await fsp.rm(f, { force: true }); return send(res, 200, { ok: true }); }
+      if (m === 'DELETE') { if (mm.by !== u.id && !can(u, 'delete')) return send(res, 403, { error: 'You can only delete your own mixes' }); await fsp.rm(f, { force: true }); scheduleMirror(sid); return send(res, 200, { ok: true }); }
     }
   }
   send(res, 404, { error: 'Not found' });
@@ -871,7 +971,8 @@ async function handle(req, res) {
 const listener = (req, res) => handle(req, res).catch(e => { if (!res.headersSent) send(res, e.code >= 400 && e.code < 600 ? e.code : 500, { error: e.message }); else res.destroy(); });
 
 // ---------- start ----------
-http.createServer(listener).listen(PORT, () => console.log(`LiveVault ${VERSION}: http on ${PORT}` + (watchOn() ? `, watching ${WATCH}` : '')));
+if (libOn) setTimeout(() => syncAllMirrors().then(() => console.log(`library folders up to date in ${LIB}`)), 2000).unref();
+http.createServer(listener).listen(PORT, () => console.log(`LiveVault ${VERSION}: http on ${PORT}` + (watchOn() ? `, watching ${WATCH}` : '') + (libOn ? `, audio in ${LIB}` : '')));
 if (HTTPS_PORT) {
   try {
     const dir = path.join(DATA, 'tls'), key = path.join(dir, 'key.pem'), cert = path.join(dir, 'cert.pem');

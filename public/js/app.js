@@ -634,6 +634,11 @@ async function settingsPage(main) {
     h('div', { class: 'card' }, h('h2', {}, 'Storage'),
       [['Sessions', String(st.sessions)], ['Tracks (96 kHz WAV)', fmtMB(st.audio)], ['Originals', fmtMB(st.originals)], ['Previews and waveforms', fmtMB(st.previews)], ['Recordings', fmtMB(st.recordings)], ['Mixes', fmtMB(st.mixes)], st.free != null && ['Free space', fmtMB(st.free)]]
         .filter(Boolean).map(([k, v]) => h('div', { class: 'stat' }, h('span', {}, k), h('b', {}, v))),
+      st.libraryError && h('div', { class: 'errbox', style: 'margin-top:8px' }, st.libraryError),
+      h('div', { class: 'note', style: 'margin-top:8px' }, st.library ? `Audio is on the library drive (${st.library.path}${st.library.free != null ? ', ' + fmtMB(st.library.free) + ' free' : ''}). Each session has a readable folder there, with one folder per version, Recordings and Mixes; share the dataset over SMB read-only to browse it.` :
+        'Audio is in the app\'s Docker volume. Mount a dataset at /library to keep it on a drive you can browse over SMB, with a readable folder per session.'),
+      st.library && h('div', { class: 'row', style: 'margin-top:8px' }, h('button', { onclick: () => act(async () => { const r = await api('POST', '/api/storage/library'); alert(`Library folders rebuilt (${r.folders} sessions).`); }) }, 'Rebuild library folders'),
+        h('span', { class: 'note' }, 'Only needed if files in the session folders were moved or deleted by hand.')),
       h('div', { class: 'row', style: 'margin-top:10px' }, h('button', { onclick: () => act(async () => { const r = await api('POST', '/api/storage/cleanup'); S.msg = ''; alert(`Removed ${r.files} unused files (${fmtMB(r.bytes)}).`); }) }, 'Clean up unused audio'),
         h('span', { class: 'note' }, 'Deletes audio that no version or unsaved change uses any more (left behind by deleted sessions and discarded uploads).')))));
 }

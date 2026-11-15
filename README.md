@@ -26,11 +26,28 @@ Open **https://<server IP>:9543**, accept the certificate warning once, and crea
 
 For TrueNAS, paste `truenas-app.yaml` into Apps > Discover Apps > Custom App > Install via YAML.
 
-Everything LiveVault keeps (tracks, sessions, mixes, recordings, users, certificate) is in the `livevault-data` volume. Port 9580 is plain http; LiveWebMixer reaches LiveVault through it, and a reverse proxy can use it too.
+LiveVault keeps the audio in the library dataset (below) and everything else (sessions, mixes, users, previews, certificate) in the `livevault-data` volume. Port 9580 is plain http; LiveWebMixer reaches LiveVault through it, and a reverse proxy can use it too.
+
+### Audio library on a drive
+
+The YAML mounts a dataset at `/library`. LiveVault keeps all audio there (tracks and Main LR recordings), and everything else (users, settings, previews, the 48 kHz copies LiveWebMixer plays) in the `livevault-data` volume. Each session gets a readable folder:
+
+```
+Goodness of God (2026-03-01)/
+  v1.0.0/01 Kick.wav, 02 Bass.wav, … REF Full Mix.wav
+  v1.0.1/…
+  Recordings/2026-11-14 Run 1 (v1.0.1).wav
+  Mixes/Sam's mix (v1.0.1).json
+.livevault/          the one stored copy of every file (LiveVault's own; leave it alone)
+```
+
+The version folders are hard links to the stored copy, so a track that is in five versions takes the space of one. LiveVault owns these folders: it renames them when a session is renamed and removes them when a session is deleted, so share the dataset over SMB **read-only** and make changes in LiveVault. The stored files are read-only too, so a hard-linked track cannot be changed by accident.
+
+On TrueNAS: create a dataset (for example `tank/LiveVault Library`), give user ID 1000 Modify permission in its ACL (that is the user LiveVault runs as), put its path on the left of the `/library` line, and add a read-only SMB share for it. Without a `/library` mount, the audio stays in the volume as before. When you add the mount later, LiveVault moves the existing audio to the drive the next time it starts (Settings > Storage shows where it is).
 
 ### Watch folder (optional)
 
-The watch folder is the one thing that is not inside the volume, because it needs to be a folder you can drop files into from other computers. Share a dataset over SMB and mount it at `/watch` (see the commented line in the YAML). The container runs as user 1000, so give that user write access to the share; imported folders are then moved into `_imported`. LiveVault waits until a folder has stopped changing for 30 seconds before importing it, so a slow copy is fine.
+The watch folder needs to be a folder you can drop files into from other computers, so it is a dataset too. Share a dataset over SMB and mount it at `/watch` (see the commented line in the YAML). The container runs as user 1000, so give that user write access to the share; imported folders are then moved into `_imported`. LiveVault waits until a folder has stopped changing for 30 seconds before importing it, so a slow copy is fine.
 
 ## Connect LiveWebMixer
 
