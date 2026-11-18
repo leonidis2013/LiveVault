@@ -18,6 +18,8 @@ services:
       - livevault-data:/data
       # the audio library: a folder you can browse over the network (one readable folder per session)
       - ./library:/library
+      # your master folder of multitracks, read-only: Library > Import > From the master folder
+      - ./multitracks:/import:ro
       # optional watch folder: drop a folder of tracks (or a zip) here and it becomes a session.
       # Point the left side at a shared folder you can reach from other computers.
       # - /path/to/LiveVault Inbox:/watch

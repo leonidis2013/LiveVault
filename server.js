@@ -57,7 +57,21 @@ function moveTreeSync(from, to) {
 for (const d of Object.values(D)) fs.mkdirSync(d, { recursive: true });
 const AUDIO_EXT = new Set(['.wav', '.wave', '.bwf', '.aif', '.aiff', '.flac', '.mp3', '.m4a', '.aac', '.ogg', '.opus', '.wma', '.caf']);
 const PERMS = ['upload', 'edit', 'delete', 'download', 'mix', 'seeMixes', 'licensed'];
-const SOURCES = ['sq5', 'purchased', 'training', 'daw', 'other'];
+const SOURCES = ['service', 'rehearsal', 'purchased', 'training', 'studio', 'other'];   // shown as "Type"
+const OLD_SOURCE = { sq5: 'service', daw: 'studio' };
+// Instrument groups, guessed from track names (first match wins, so "Bass Drum" is drums and "Lead Gtr" is guitars).
+const GROUPS = ['drums', 'perc', 'bass', 'guitars', 'keys', 'vocals', 'tracks', 'other'];
+const GROUP_COLORS = { drums: '#e5484d', perc: '#f76b15', bass: '#ffc53d', guitars: '#46a758', keys: '#12a594', vocals: '#4c8dff', tracks: '#8e4ec6', other: '#8b8d98' };
+const GROUP_RULES = [
+  ['tracks', /\b(click|clk|guide|guides|cue|cues|count ?in|loops?|seq|sequence|tracks?|smpte|ltc|mtc|playback|stems?)\b/],
+  ['drums', /\b(kick|kik|bd|bass ?drum|snare|snr|sn|toms?|tom ?\d|floor|rack|hats?|hh|hi ?hat|ride|crash|cymbals?|cym|oh|ohs|overheads?|room|drums?|kit|trash)\b/],
+  ['perc', /\b(perc|percussion|shaker|tamb|tambourine|conga|congas|bongos?|cajon|clap|claps|djembe|timpani|bells?|chimes)\b/],
+  ['bass', /\b(bass|bs|sub|subs|808|bass ?gtr|bass ?di)\b/],
+  ['guitars', /\b(gtrs?|guitars?|eg|egs?|ag|ags?|acoustic|electric|elec|banjo|mandolin|mando|dobro|steel|uke|ukulele)\b/],
+  ['keys', /\b(keys?|keyboards?|piano|pno|rhodes|organ|b3|hammond|synths?|pads?|wurli|ep|strings|str|orch|orchestra|horns?|brass)\b/],
+  ['vocals', /\b(vox|vocals?|voc|vo|lead|ld|bgvs?|bvs?|bg|backing|choir|harmony|harm|alto|tenor|soprano|sop|bari|singer|talk|speech|pastor|mc)\b/],
+];
+const groupOf = name => { const n = ' ' + String(name || '').toLowerCase().replace(/[_\-.()\[\]]+/g, ' ').replace(/(\d+)/g, ' $1 ') + ' '; for (const [g, re] of GROUP_RULES) if (re.test(n)) return g; return 'other'; };
 const KINDS = ['channel', 'reference', 'off'];
 const LOGIN_DAYS = 30;
 
@@ -119,8 +133,9 @@ function withJson(file, dflt, fn) {
 
 // ---------- settings ----------
 const SETTINGS_F = path.join(DATA, 'settings.json');
-const SETTINGS_DEFAULT = { lwmUrl: '', keepOriginals: true, watchSource: 'sq5' };
+const SETTINGS_DEFAULT = { lwmUrl: '', vaultUrl: '', keepOriginals: true, watchSource: 'service' };
 let settings = { ...SETTINGS_DEFAULT, ...(JSON.parse(fs.existsSync(SETTINGS_F) ? fs.readFileSync(SETTINGS_F, 'utf8') : '{}')) };
+settings.watchSource = OLD_SOURCE[settings.watchSource] || settings.watchSource;
 
 // ---------- users and logins ----------
 const USERS_F = path.join(DATA, 'users.json'), LOGINS_F = path.join(DATA, 'logins.json');
@@ -171,7 +186,12 @@ function noteFail(ip) { const f = fails.get(ip); if (!f || now() - f.t > 600e3) 
 const sessions = new Map();
 for (const f of fs.readdirSync(D.sessions)) {
   if (!f.endsWith('.json')) continue;
-  try { const s = JSON.parse(fs.readFileSync(path.join(D.sessions, f), 'utf8')); sessions.set(s.id, s); } catch (e) { console.error('Could not read session', f, e.message); }
+  try { const s = JSON.parse(fs.readFileSync(path.join(D.sessions, f), 'utf8')); upgradeSession(s); sessions.set(s.id, s); } catch (e) { console.error('Could not read session', f, e.message); }
+}
+// sessions saved by older versions: new type names, instrument groups on every track
+function upgradeSession(s) {
+  s.source = OLD_SOURCE[s.source] || s.source;
+  for (const ts of [...s.versions.map(v => v.tracks), s.draft ? s.draft.tracks : []]) for (const t of ts) if (!t.group) t.group = groupOf(t.name);
 }
 const sesLocks = new Map();
 function withSession(sid, fn) {
@@ -194,7 +214,8 @@ const trackDur = ts => Math.max(0, ...ts.map(t => t.duration || 0));
 function summary(s) {
   const l = latest(s), ts = l ? l.tracks : (s.draft ? s.draft.tracks : []);
   return { id: s.id, name: s.name, artist: s.artist, source: s.source, tags: s.tags, difficulty: s.difficulty, bpm: s.bpm, key: s.key, recorded: s.recorded || '', version: l ? l.v : null,
-    tracks: ts.filter(t => t.kind !== 'off').length, duration: trackDur(ts), restricted: !!s.license.restricted, draft: !!s.draft, created: s.created, updated: s.updated };
+    tracks: ts.filter(t => t.kind !== 'off').length, duration: trackDur(ts), restricted: !!s.license.restricted, draft: !!s.draft, created: s.created, updated: s.updated,
+    ready: l ? readyFor(l) : null };
 }
 function newSession(b, uid) {
   return { id: id(4), name: str(b.name, 100) || 'New session', artist: str(b.artist, 100), source: SOURCES.includes(b.source) ? b.source : 'other', sourceNote: '', bpm: '', key: '',
@@ -220,7 +241,7 @@ function applyMeta(s, b) {
     if (Array.isArray(L.allow)) o.allow = L.allow.filter(x => users.some(u => u.id === x));
   }
 }
-const cleanTrack = t => ({ id: t.id, name: t.name, kind: t.kind, hash: t.hash, origHash: t.origHash || null, origExt: t.origExt || null, channels: t.channels, duration: t.duration, srcRate: t.srcRate, srcFormat: t.srcFormat, srcName: t.srcName });
+const cleanTrack = t => ({ id: t.id, name: t.name, kind: t.kind, group: t.group || groupOf(t.name), groupSet: !!t.groupSet, silent: !!t.silent, hash: t.hash, origHash: t.origHash || null, origExt: t.origExt || null, channels: t.channels, duration: t.duration, srcRate: t.srcRate, srcFormat: t.srcFormat, srcName: t.srcName });
 function ensureDraft(s, uid) {
   if (!s.draft) { const l = latest(s); s.draft = { base: l ? l.v : null, by: uid, started: now(), tracks: l ? l.tracks.map(t => ({ ...clone(t), status: 'ready', error: '' })) : [] }; }
   return s.draft;
@@ -234,13 +255,13 @@ function bumpVersion(v, kind) {
 function diff(a, b) {
   a = a || []; b = b || [];
   const A = new Map(a.map(t => [t.id, t])), B = new Map(b.map(t => [t.id, t]));
-  const out = { added: [], removed: [], renamed: [], replaced: [], kind: [], reordered: false };
+  const out = { added: [], removed: [], renamed: [], replaced: [], kind: [], grouped: [], reordered: false };
   for (const t of b) if (!A.has(t.id)) out.added.push(t.name);
   for (const t of a) if (!B.has(t.id)) out.removed.push(t.name);
-  for (const t of b) { const o = A.get(t.id); if (!o) continue; if (o.name !== t.name) out.renamed.push([o.name, t.name]); if (o.hash !== t.hash) out.replaced.push(t.name); if (o.kind !== t.kind) out.kind.push([t.name, o.kind, t.kind]); }
+  for (const t of b) { const o = A.get(t.id); if (!o) continue; if (o.name !== t.name) out.renamed.push([o.name, t.name]); if (o.hash !== t.hash) out.replaced.push(t.name); if (o.kind !== t.kind) out.kind.push([t.name, o.kind, t.kind]); if ((o.group || '') !== (t.group || '') && o.group) out.grouped.push([t.name, o.group, t.group]); }
   const ca = a.filter(t => B.has(t.id)).map(t => t.id).join(), cb = b.filter(t => A.has(t.id)).map(t => t.id).join();
   out.reordered = ca !== cb;
-  out.changed = !!(out.added.length || out.removed.length || out.renamed.length || out.replaced.length || out.kind.length || out.reordered);
+  out.changed = !!(out.added.length || out.removed.length || out.renamed.length || out.replaced.length || out.kind.length || out.grouped.length || out.reordered);
   return out;
 }
 function saveVersion(s, uid, bump, message) {
@@ -249,9 +270,12 @@ function saveVersion(s, uid, bump, message) {
   if (!d.tracks.length) throw httpErr(400, 'Add at least one track first');
   const l = latest(s), dd = diff(l && l.tracks, d.tracks);
   if (l && !dd.changed) throw httpErr(400, 'Nothing changed since ' + l.v);
-  const v = bumpVersion(l && l.v, ['major', 'minor', 'patch'].includes(bump) ? bump : 'minor');
+  // "auto": new, removed or replaced audio is a minor version; names, order, groups and roles are a patch
+  const kind = ['major', 'minor', 'patch'].includes(bump) ? bump : (dd.added.length || dd.removed.length || dd.replaced.length) ? 'minor' : 'patch';
+  const v = bumpVersion(l && l.v, kind);
   s.versions.push({ v, created: now(), by: uid, message: str(message, 500) || (l ? '' : 'First version'), base: d.base, tracks: d.tracks.map(cleanTrack), changes: dd });
   s.draft = null;
+  queueMixer(s.versions[s.versions.length - 1].tracks.filter(t => t.kind !== 'off').map(t => t.hash));   // get it ready for LiveWebMixer
   return v;
 }
 
@@ -286,8 +310,10 @@ async function renderPreview(src, op, pk, ch) {
   const raw = await run('ffmpeg', ['-v', 'error', '-i', src, '-ac', '1', '-ar', '4000', '-f', 's16le', '-'], true);
   const n = raw.length >> 1, B = 1000, p = new Array(B).fill(0);
   for (let i = 0; i < n; i++) { const v = Math.abs(raw.readInt16LE(i * 2)); const b = Math.min(B - 1, Math.floor(i / n * B)); if (v > p[b]) p[b] = v; }
-  await writeJson(pk, { n: B, p: p.map(v => Math.round(v / 327.68)) });
+  await writeJson(pk, { n: B, p: p.map(v => Math.round(v / 327.68)), max: Math.max(0, ...p) });
 }
+// A track counts as silent when nothing in it reaches -60 dBFS (32 of 32768).
+async function isSilent(h) { const pk = await readJson(shard(D.prev, h, '.peaks.json'), null); if (!pk) return false; return pk.max != null ? pk.max < 33 : pk.p.every(v => v === 0); }
 // One uploaded file -> one or more stored tracks. Results are remembered per raw file hash, so the same file uploads instantly next time.
 async function ingestFile(file, origName, workDir) {
   const rawSha = await hashFile(file), rawF = path.join(D.raw, rawSha + '.json');
@@ -335,16 +361,19 @@ async function processTrack(sid, tid) {
   let tr;
   await withSession(sid, s => { tr = s.draft && s.draft.tracks.find(t => t.id === tid); if (!tr || tr.status === 'ready') { tr = null; return false; } tr.status = 'processing'; tr.error = ''; }).catch(() => {});
   if (!tr) return;
-  const dir = path.join(D.inc, tid), file = path.join(dir, tr.job.file);
+  const dir = path.join(D.inc, tid), file = tr.job.abs || path.join(dir, tr.job.file);
   try {
-    if (!await exists(file)) throw new Error('The uploaded file is missing; upload it again');
+    if (!await exists(file)) throw new Error(tr.job.abs ? 'The file is no longer in the import folder' : 'The uploaded file is missing; upload it again');
+    await fsp.mkdir(dir, { recursive: true });
     const rec = await ingestFile(file, tr.job.origName, dir);
+    const silent = await Promise.all(rec.outs.map(o => isSilent(o.hash)));
     if (tr.job.replace && rec.outs.length > 1) throw new Error(`This file has ${rec.srcChannels} channels; a replacement needs a mono or stereo file`);
     await withSession(sid, s => {
       const ts = s.draft && s.draft.tracks, i = ts ? ts.findIndex(t => t.id === tid) : -1; if (i < 0) return false;
       const base = ts[i], many = rec.outs.length > 1;
       const made = rec.outs.map((o, k) => ({ ...base, id: k ? id(4) : base.id, name: many ? `${base.name} ${o.chan + 1}`.slice(0, 60) : base.name, hash: o.hash, channels: o.channels, duration: o.duration,
-        origHash: rec.origHash, origExt: rec.origExt, srcRate: rec.srcRate, srcFormat: rec.srcFormat + (many ? ` (ch ${o.chan + 1} of ${rec.srcChannels})` : ''), status: 'ready', error: '', job: undefined }));
+        origHash: rec.origHash, origExt: rec.origExt, srcRate: rec.srcRate, srcFormat: rec.srcFormat + (many ? ` (ch ${o.chan + 1} of ${rec.srcChannels})` : ''), status: 'ready', error: '', job: undefined,
+        silent: silent[k], kind: silent[k] && !base.job.replace && base.kind === 'channel' ? 'off' : base.kind }));   // empty tracks start as "not used"
       for (const m of made) delete m.job;
       ts.splice(i, 1, ...made);
       maybeAutoSave(s);
@@ -362,19 +391,20 @@ function maybeAutoSave(s) {
 for (const s of sessions.values()) if (s.draft) for (const t of s.draft.tracks) if (t.status === 'queued' || t.status === 'processing') enqueue(s.id, t.id);
 
 // Add one audio file (already on disk) to a session's draft as a new track, or as new audio for an existing track.
-async function addTrack(sid, uid, tmpFile, origName, replaceTid) {
+// abs: read the file where it is (the read-only import folder) instead of moving it in.
+async function addTrack(sid, uid, tmpFile, origName, replaceTid, abs) {
   const tid = replaceTid || id(4), dir = path.join(D.inc, tid);
   if (replaceTid) await fsp.rm(dir, { recursive: true, force: true });
   const file = 'src' + (path.extname(origName).toLowerCase().replace(/[^.a-z0-9]/g, '') || '.bin');
-  await moveFile(tmpFile, path.join(dir, file));
+  if (!abs) await moveFile(tmpFile, path.join(dir, file));
   await withSession(sid, s => {
     const d = ensureDraft(s, uid);
     if (replaceTid) {
       const t = d.tracks.find(t => t.id === replaceTid); if (!t) throw httpErr(404, 'Track not found');
-      Object.assign(t, { status: 'queued', error: '', job: { file, origName, replace: true } });
+      Object.assign(t, { status: 'queued', error: '', job: { file, origName, replace: true, abs: abs ? tmpFile : undefined } });
     } else {
       const nm = cleanName(origName).slice(0, 60);
-      d.tracks.push({ id: tid, name: nm, kind: isRefName(nm) ? 'reference' : 'channel', status: 'queued', error: '', hash: null, channels: 0, duration: 0, srcName: origName.slice(0, 200), job: { file, origName } });
+      d.tracks.push({ id: tid, name: nm, kind: isRefName(nm) ? 'reference' : 'channel', group: groupOf(nm), status: 'queued', error: '', hash: null, channels: 0, duration: 0, srcName: origName.slice(0, 200), job: { file, origName, abs: abs ? tmpFile : undefined } });
     }
   });
   enqueue(sid, tid);
@@ -429,6 +459,7 @@ function sessionOut(u, s) {
   const ids = new Set([s.createdBy, ...s.versions.map(v => v.by), s.draft && s.draft.by].filter(Boolean));
   o.names = Object.fromEntries([...ids].map(x => [x, userName(x)]));
   o.mixCount = 0;
+  o.ready = Object.fromEntries(s.versions.map(v => [v.v, readyFor(v)]));
   o.can = { upload: can(u, 'upload'), edit: can(u, 'edit'), delete: can(u, 'delete'), download: can(u, 'download'), mix: can(u, 'mix'), lwm: !!settings.lwmUrl };
   if (!can(u, 'edit') && !u.admin) o.license = { kind: s.license.kind, holder: s.license.holder, terms: s.license.terms, restricted: s.license.restricted, allow: [] };
   return o;
@@ -481,6 +512,76 @@ async function importWatched(name, p, isZip, files) {
 }
 setInterval(scanWatch, +(process.env.WATCH_SCAN_MS || 15e3)).unref();
 
+// ---------- import from your master folder on the server (mounted read-only at /import) ----------
+// Works out which folders are songs, even when the master folder is not organized the same way throughout.
+const IMPORT = path.resolve(process.env.IMPORT_DIR || '/import');
+const importOn = () => { try { return fs.statSync(IMPORT).isDirectory(); } catch { return false; } };
+// Folder names that hold part of a song (stems, a drums folder, a click folder…) rather than a song of their own.
+const STEM_DIR = /^(stems?|multi ?tracks?|tracks?|audio( files)?|bounced ?files|bounces?|exports?|renders?|drums?|perc(ussion)?|bass|guitars?|gtrs?|keys|keyboards?|synths?|pads?|vocals?|vox|bgvs?|choir|strings|horns|brass|fx|sfx|click( ?track)?|guides?|cues?|loops?|misc|other|extras?|mono|stereo|wavs?|aiff?|flac|mp3s?|(44\.1|48|88\.2|96) ?k?(hz)?( wav)?|(16|24|32)[ -]?bit)$/i;
+function importAbs(rel) {
+  const a = path.resolve(IMPORT, '.' + path.sep + String(rel || '').replace(/^\/+/, ''));
+  if (a !== IMPORT && !a.startsWith(IMPORT + path.sep)) throw httpErr(400, 'That folder is outside the import folder');
+  return a;
+}
+const importRel = a => path.relative(IMPORT, a).split(path.sep).join('/');
+async function scanTree(abs, depth = 0, budget = { n: 0 }) {
+  const node = { name: path.basename(abs), abs, files: [], dirs: [] };
+  if (depth > 8 || budget.n > 100000) return node;
+  for (const e of (await fsp.readdir(abs, { withFileTypes: true }).catch(() => [])).sort((a, b) => natural(a.name, b.name))) {
+    if (e.name.startsWith('.') || e.name === '__MACOSX' || e.name.startsWith('#')) continue;
+    const p = path.join(abs, e.name);
+    if (e.isDirectory()) { const c = await scanTree(p, depth + 1, budget); if (c.total) node.dirs.push(c); }
+    else if (e.isFile() && AUDIO_EXT.has(path.extname(e.name).toLowerCase())) {
+      const st = await fsp.stat(p).catch(() => null); if (!st) continue; budget.n++;
+      node.files.push({ abs: p, name: e.name, size: st.size, date: Math.min(st.birthtimeMs > 0 ? st.birthtimeMs : Infinity, st.mtimeMs) });
+    }
+  }
+  node.total = node.files.length + node.dirs.reduce((n, d) => n + d.total, 0);
+  return node;
+}
+const allFiles = n => [...n.files, ...n.dirs.flatMap(allFiles)];
+const isSongNode = n => n.files.length > 0 || (n.dirs.length > 0 && n.dirs.every(d => STEM_DIR.test(d.name.trim())));
+// The import plan: which folders become sessions. mode "auto" finds the song folders, "folder" makes every folder
+// that holds audio its own session, "one" makes everything one session.
+function planImport(root, mode) {
+  const out = [];
+  const add = (n, parent, files) => out.push({ node: n, files, folder: importRel(n.abs), name: n.name.replace(/[_]+/g, ' ').trim(), band: parent && parent !== root ? parent.name.replace(/[_]+/g, ' ').trim() : '' });
+  const walk = (n, parent) => {
+    if (mode === 'folder') { if (n.files.length) add(n, parent, n.files); for (const d of n.dirs) walk(d, n); return; }
+    if (isSongNode(n)) return add(n, parent, allFiles(n));
+    for (const d of n.dirs) walk(d, n);
+  };
+  if (mode === 'one') add(root, null, allFiles(root)); else walk(root, null);
+  const done = new Set([...sessions.values()].map(x => x.importedFrom).filter(Boolean));
+  return out.map(x => ({ ...x, imported: done.has('import:' + x.folder), size: x.files.reduce((a, f) => a + f.size, 0), oldest: Math.min(...x.files.map(f => f.date)) }));
+}
+const pubPlan = items => items.map(x => ({ folder: x.folder, name: x.name, band: x.band, files: x.files.length, size: x.size, recorded: isFinite(x.oldest) ? localDate(x.oldest) : '', imported: x.imported,
+  sample: x.files.slice(0, 6).map(f => path.relative(x.node.abs, f.abs).split(path.sep).join('/')) }));
+let importJob = null;
+async function runImport(u, rootRel, mode, picks, type, save) {
+  const job = importJob = { running: true, by: u.display, started: now(), total: picks.length, done: 0, files: 0, current: '', errors: [], sessions: [], stop: false };
+  try {
+    const root = await scanTree(importAbs(rootRel)), plan = new Map(planImport(root, mode).map(x => [x.folder, x]));
+    for (const p of picks) {
+      if (job.stop) break;
+      const item = plan.get(p.folder); if (!item) { job.errors.push(`${p.folder}: folder not found any more`); job.done++; continue; }
+      job.current = p.name || item.name;
+      try {
+        const sObj = newSession({ name: str(p.name, 100) || item.name, artist: str(p.band, 100), source: type }, u.id);
+        sObj.importedFrom = 'import:' + item.folder; sObj.sourceNote = 'Imported from ' + (item.folder || 'the import folder');
+        sObj.draft = { base: null, by: u.id, started: now(), tracks: [] };
+        if (isFinite(item.oldest)) noteFileDate(sObj, localDate(item.oldest));
+        await writeJson(path.join(D.sessions, sObj.id + '.json'), sObj); sessions.set(sObj.id, sObj);
+        for (const f of [...item.files].sort((a, b) => natural(path.relative(item.node.abs, a.abs), path.relative(item.node.abs, b.abs)))) { await addTrack(sObj.id, u.id, f.abs, f.name, null, true); job.files++; }
+        if (save) await withSession(sObj.id, x => { if (!x.draft) return false; x.draft.autoSave = 'Imported from the master folder'; maybeAutoSave(x); });
+        job.sessions.push(sObj.id);
+      } catch (e) { job.errors.push(`${item.name}: ${e.message}`); }
+      job.done++;
+    }
+  } catch (e) { job.errors.push(e.message); }
+  job.running = false; job.current = ''; job.finished = now();
+}
+
 // ---------- mixes ----------
 const mixDir = sid => path.join(D.mixes, sid);
 async function listMixes(sid) {
@@ -530,7 +631,17 @@ async function addRecording(req, s, u, version, q) {
 // ---------- mixer copies: what LiveWebMixer plays (48 kHz FLAC, and Opus for remote use) ----------
 const MIXQ = { flac: { ext: '.flac', mime: 'audio/flac' }, hi: { ext: '.hi.opus', mime: 'audio/ogg', kbps: [96, 160] }, lo: { ext: '.lo.opus', mime: 'audio/ogg', kbps: [48, 80] } };
 const mixerPath = (h, q) => shard(path.join(DATA, 'mixer'), h, MIXQ[q].ext);
-const mixerJobs = new Map();
+const mixerJobs = new Map(), mixerReady = new Set();
+// which tracks already have their mixer copies (looked up once at start, then kept up to date)
+(() => {
+  const root = path.join(DATA, 'mixer'), n = new Map();
+  for (const sub of (() => { try { return fs.readdirSync(root); } catch { return []; } })()) for (const f of (() => { try { return fs.readdirSync(path.join(root, sub)); } catch { return []; } })()) {
+    const m = /^([a-f0-9]{64})\.(flac|hi\.opus|lo\.opus)$/.exec(f); if (m) n.set(m[1], (n.get(m[1]) || 0) + 1);
+  }
+  for (const [h, c] of n) if (c === 3) mixerReady.add(h);
+})();
+// How much of a version LiveWebMixer can already play.
+function readyFor(v) { const ts = v.tracks.filter(t => t.kind !== 'off'); return { ready: ts.filter(t => mixerReady.has(t.hash)).length, total: ts.length }; }
 function mixerCopies(h) {
   if (mixerJobs.has(h)) return mixerJobs.get(h);
   const job = (async () => {
@@ -545,7 +656,7 @@ function mixerCopies(h) {
     }
     try { await run('ffmpeg', args); for (const [a, b] of tmp) await fsp.rename(a, b); }
     finally { for (const [a] of tmp) fsp.rm(a, { force: true }).catch(() => {}); }
-  })();
+  })().then(() => { mixerReady.add(h); });
   mixerJobs.set(h, job); job.finally(() => mixerJobs.delete(h)).catch(() => {});
   return job;
 }
@@ -556,12 +667,16 @@ async function mixerSizes(h, ch, dur) {
 }
 // Make the mixer copies in the background for every saved version (one at a time, so imports stay quick).
 const mixerQueue = []; let mixerBusy = false;
-function queueMixer(hashes) { for (const h of hashes) if (h && !mixerQueue.includes(h)) mixerQueue.push(h); if (!mixerBusy) mixerNext(); }
+function queueMixer(hashes, first) {
+  const todo = hashes.filter(h => h && !mixerReady.has(h));
+  for (const h of first ? [...todo].reverse() : todo) { const i = mixerQueue.indexOf(h); if (i >= 0) { if (!first) continue; mixerQueue.splice(i, 1); } first ? mixerQueue.unshift(h) : mixerQueue.push(h); }
+  if (!mixerBusy) mixerNext();
+}
 async function mixerNext() { mixerBusy = true; while (mixerQueue.length) { const h = mixerQueue.shift(); await mixerCopies(h).catch(e => console.error('mixer copy', e.message)); } mixerBusy = false; }
 setTimeout(() => queueMixer([...sessions.values()].flatMap(s => s.versions.flatMap(v => v.tracks.map(t => t.hash)))), 5000).unref();
 
 // Sessions as LiveWebMixer sees them (docs/LIVEVAULT-API.md in LiveWebMixer).
-const v1List = s => { const vs = [...s.versions].reverse(); return { id: s.id, name: s.name, latest: vs[0].v, versions: vs.map(v => v.v), tags: s.tags, recorded: s.recorded || '', tracks: vs[0].tracks.filter(t => t.kind !== 'off').length, duration: trackDur(vs[0].tracks) }; };
+const v1List = s => { const vs = [...s.versions].reverse(); return { id: s.id, name: s.name, band: s.artist || '', type: s.source, latest: vs[0].v, versions: vs.map(v => v.v), tags: s.tags, recorded: s.recorded || '', tracks: vs[0].tracks.filter(t => t.kind !== 'off').length, duration: trackDur(vs[0].tracks) }; };
 const lwmMixFile = async (s, u, ver) => (await listMixesFull(s.id)).find(m => m.lwm && m.by === u.id && m.version === ver) || null;
 async function listMixesFull(sid) {
   const out = [];
@@ -706,8 +821,8 @@ async function handle(req, res) {
       if (seg.length === 6 && m === 'GET') {
         queueMixer(v.tracks.map(t => t.hash));
         const tracks = [];
-        for (const t of v.tracks) if (t.kind !== 'off') tracks.push({ id: t.id, name: t.name, file: t.hash, role: t.kind, channels: t.channels > 1 ? 2 : 1, duration: t.duration, sizes: await mixerSizes(t.hash, t.channels, t.duration) });
-        return send(res, 200, { id: s.id, name: s.name, version: v.v, versions: [...s.versions].reverse().map(x => x.v), tags: s.tags, notes: [s.listenFor && 'Listen for: ' + s.listenFor, s.notes].filter(Boolean).join('\n\n'), tracks });
+        for (const t of v.tracks) if (t.kind !== 'off') tracks.push({ id: t.id, name: t.name, file: t.hash, role: t.kind, group: t.group || groupOf(t.name), color: GROUP_COLORS[t.group || groupOf(t.name)], channels: t.channels > 1 ? 2 : 1, duration: t.duration, sizes: await mixerSizes(t.hash, t.channels, t.duration) });
+        return send(res, 200, { id: s.id, name: s.name, band: s.artist || '', type: s.source, recorded: s.recorded || '', key: s.key || '', bpm: s.bpm || '', version: v.v, versions: [...s.versions].reverse().map(x => x.v), tags: s.tags, notes: [s.listenFor && 'Listen for: ' + s.listenFor, s.notes].filter(Boolean).join('\n\n'), tracks });
       }
       if (seg[6] === 'mixes' && seg[7] === 'livewebmixer' && seg.length === 8) {
         const mm = await lwmMixFile(s, u, v.v);
@@ -732,7 +847,7 @@ async function handle(req, res) {
   if (m !== 'GET' && m !== 'HEAD' && req.headers['x-livevault'] !== '1') return send(res, 403, { error: 'Missing request header' });
   const u = currentUser(req);
 
-  if (isApi && seg[1] === 'state' && m === 'GET') return send(res, 200, { version: VERSION, needsSetup: !users.length, user: u ? pubUser(u) : null, watch: watchOn(), busy: running + queue.length });
+  if (isApi && seg[1] === 'state' && m === 'GET') return send(res, 200, { version: VERSION, needsSetup: !users.length, user: u ? pubUser(u) : null, watch: watchOn(), import: importOn(), lwm: u && can(u, 'mix') ? settings.lwmUrl : '', busy: running + queue.length });
   if (isApi && seg[1] === 'setup' && m === 'POST') {
     if (users.length) return send(res, 400, { error: 'LiveVault is already set up' });
     const b = await readBody(req), un = str(b.username, 40).toLowerCase();
@@ -821,13 +936,40 @@ async function handle(req, res) {
     }
   }
 
+  // ---- import from the master folder on the server ----
+  if (seg[1] === 'import') {
+    if (!can(u, 'upload')) return send(res, 403, { error: 'You do not have permission to add sessions' });
+    if (seg[2] === 'status' && m === 'GET') return send(res, 200, { on: importOn(), busy: running + queue.length, job: importJob && { ...importJob, stop: undefined } });
+    if (!importOn()) return send(res, 400, { error: 'No import folder is mounted. Add your master folder to the YAML as /import (see Settings).' });
+    if (seg[2] === 'browse' && m === 'GET') {
+      const abs = importAbs(q.get('path')), rel = importRel(abs);
+      const dirs = (await fsp.readdir(abs, { withFileTypes: true }).catch(() => [])).filter(e => e.isDirectory() && !e.name.startsWith('.') && e.name !== '__MACOSX').map(e => e.name).sort(natural);
+      return send(res, 200, { path: rel, parent: rel ? importRel(path.dirname(abs)) : null, folders: dirs.map(n => ({ name: n, path: (rel ? rel + '/' : '') + n })) });
+    }
+    if (seg[2] === 'plan' && m === 'GET') {
+      const mode = ['auto', 'folder', 'one'].includes(q.get('mode')) ? q.get('mode') : 'auto', root = await scanTree(importAbs(q.get('path')));
+      const items = planImport(root, mode);
+      return send(res, 200, { path: importRel(root.abs), mode, files: root.total, sessions: pubPlan(items) });
+    }
+    if (seg[2] === 'run' && m === 'POST') {
+      if (importJob && importJob.running) return send(res, 409, { error: 'An import is already running' });
+      const b = await readBody(req), mode = ['auto', 'folder', 'one'].includes(b.mode) ? b.mode : 'auto';
+      const picks = (Array.isArray(b.items) ? b.items : []).filter(x => x && typeof x.folder === 'string').slice(0, 5000);
+      if (!picks.length) return send(res, 400, { error: 'Pick at least one folder to import' });
+      runImport(u, String(b.path || ''), mode, picks, SOURCES.includes(b.type) ? b.type : 'other', b.save !== false).catch(e => console.error('import', e.message));
+      return send(res, 200, { ok: true });
+    }
+    if (seg[2] === 'stop' && m === 'POST') { if (importJob) importJob.stop = true; return send(res, 200, { ok: true }); }
+    return send(res, 404, { error: 'Not found' });
+  }
+
   // ---- settings and storage (admin) ----
   if (seg[1] === 'settings') {
     if (!u.admin) return send(res, 403, { error: 'Only admins can change settings' });
-    if (m === 'GET') return send(res, 200, { settings, watch: watchOn(), watchDir: WATCH, sources: SOURCES });
+    if (m === 'GET') return send(res, 200, { settings, watch: watchOn(), watchDir: WATCH, import: importOn(), sources: SOURCES });
     if (m === 'PUT') {
       const b = await readBody(req), url = v => { v = str(v, 300).replace(/\/+$/, ''); if (v && !/^https?:\/\/[^\s]+$/i.test(v)) throw httpErr(400, 'Addresses start with http:// or https://'); return v; };
-      settings = { lwmUrl: url(b.lwmUrl), keepOriginals: b.keepOriginals !== false, watchSource: SOURCES.includes(b.watchSource) ? b.watchSource : 'sq5' };
+      settings = { lwmUrl: url(b.lwmUrl), vaultUrl: url(b.vaultUrl), keepOriginals: b.keepOriginals !== false, watchSource: SOURCES.includes(b.watchSource) ? b.watchSource : 'service' };
       await writeJson(SETTINGS_F, settings); return send(res, 200, { settings });
     }
   }
@@ -889,6 +1031,8 @@ async function handle(req, res) {
             const t = ensureDraft(x, u.id).tracks.find(t => t.id === tid); if (!t) throw httpErr(404, 'Track not found');
             if (typeof b.name === 'string' && b.name.trim()) t.name = str(b.name, 60);
             if (KINDS.includes(b.kind)) t.kind = b.kind;
+            if (GROUPS.includes(b.group)) { t.group = b.group; t.groupSet = true; }
+            else if (typeof b.name === 'string' && !t.groupSet) t.group = groupOf(t.name);
           })));
         }
         if (m === 'DELETE') {
@@ -929,8 +1073,16 @@ async function handle(req, res) {
       if (!settings.lwmUrl) return send(res, 400, { error: 'An admin needs to enter the LiveWebMixer address in LiveVault Settings first' });
       const b = await readBody(req), v = s.versions.find(x => x.v === b.version) || latest(s);
       if (!v) return send(res, 400, { error: 'Save a version of this session first' });
-      queueMixer(v.tracks.map(t => t.hash));
-      return send(res, 200, { url: `${settings.lwmUrl}/#vault=${encodeURIComponent(sid)}&version=${encodeURIComponent(v.v)}`, version: v.v });
+      queueMixer(v.tracks.map(t => t.hash), true);
+      // The link carries a personal token (made fresh each time, replacing the last one made this way), so LiveWebMixer
+      // connects as the person who clicked without anyone copying addresses or tokens.
+      const value = 'lv_' + id(24);
+      u.tokens = (u.tokens || []).filter(t => !t.auto);
+      u.tokens.push({ id: id(4), name: 'LiveWebMixer (from Open in LiveWebMixer)', sha: sha(value), created: now(), used: null, auto: true });
+      await saveUsers();
+      const base = settings.vaultUrl || `${req.socket.encrypted ? 'https' : 'http'}://${req.headers.host}`;
+      const q2 = new URLSearchParams({ vault: sid, version: v.v, lv: base, token: value }); if (/^https:/i.test(base) && !settings.vaultUrl) q2.set('insecure', '1');
+      return send(res, 200, { url: `${settings.lwmUrl}/#${q2}`, version: v.v, ready: readyFor(v) });
     }
     if (seg[3] === 'recordings') {
       if (seg.length === 4 && m === 'GET') return send(res, 200, { recordings: (await listRecordings(sid)).filter(x => mixVisible(u, x)) });

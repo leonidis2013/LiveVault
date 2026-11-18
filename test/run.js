@@ -19,14 +19,14 @@ function client() {
   };
   return req;
 }
-const tone = (f, rate, ch, d = 1) => { const out = path.join(data, `t${f}-${rate}-${ch}.wav`); assert.strictEqual(spawnSync('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', `sine=f=${f}:d=${d}:sample_rate=${rate}`, '-ac', String(ch), out]).status, 0); return fs.readFileSync(out); };
+const tone = (f, rate, ch, d = 1) => { const out = path.join(data, `t${f}-${rate}-${ch}.wav`); assert.strictEqual(spawnSync('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', `sine=f=${f}:d=${d}:sample_rate=${rate}`, ...(ch > 2 ? ['-af', `pan=${ch}c|` + [...Array(ch).keys()].map(i => `c${i}=c0`).join('|')] : ['-ac', String(ch)]), out]).status, 0); return fs.readFileSync(out); };
 async function untilReady(A, sid) { for (let i = 0; i < 200; i++) { const s = (await A('GET', '/api/sessions/' + sid)).body; const ts = s.draft ? s.draft.tracks : []; if (!ts.some(t => t.status === 'queued' || t.status === 'processing')) return s; await sleep(100); } throw new Error('conversion timed out'); }
 
 (async () => {
   for (const f of ['server.js']) assert.strictEqual(spawnSync(process.execPath, ['--check', path.join(root, f)]).status, 0, f + ' has a syntax error');
   for (const f of fs.readdirSync(path.join(root, 'public/js'))) { const t = path.join(data, f.replace('.js', '.mjs')); fs.writeFileSync(t, fs.readFileSync(path.join(root, 'public/js', f))); assert.strictEqual(spawnSync(process.execPath, ['--check', t]).status, 0, f + ' has a syntax error'); }
-  fs.mkdirSync(watch); const lib = path.join(data, 'lib'); fs.mkdirSync(lib);
-  const srv = spawn(process.execPath, [path.join(root, 'server.js')], { env: { ...process.env, DATA_DIR: path.join(data, 'd'), LIBRARY_DIR: lib, WATCH_DIR: watch, WATCH_SCAN_MS: '300', PORT: port, HTTPS_PORT: '0' }, stdio: 'inherit' });
+  fs.mkdirSync(watch); const lib = path.join(data, 'lib'); fs.mkdirSync(lib); const imp = path.join(data, 'import');
+  const srv = spawn(process.execPath, [path.join(root, 'server.js')], { env: { ...process.env, DATA_DIR: path.join(data, 'd'), LIBRARY_DIR: lib, IMPORT_DIR: imp, WATCH_DIR: watch, WATCH_SCAN_MS: '300', PORT: port, HTTPS_PORT: '0' }, stdio: 'inherit' });
   try {
     for (let i = 0; i < 50; i++) { try { await fetch(base + '/api/state'); break; } catch { await sleep(100); } }
     const A = client(), T = client(), anon = client();
@@ -73,6 +73,20 @@ async function untilReady(A, sid) { for (let i = 0; i < 200; i++) { const s = (a
       r = await A('DELETE', `/api/sessions/${sid}/draft/tracks/${s.draft.tracks[7].id}`); assert.strictEqual(r.body.draft.tracks.length, 7);
       r = await A('POST', `/api/sessions/${sid}/versions`, { message: 'First import' }); assert.strictEqual(r.body.version, '1.0.0');
       r = await A('PATCH', '/api/sessions/' + sid, { recorded: '2025-12-24' }); assert.strictEqual(r.body.recordedAuto, false);
+      assert.deepStrictEqual(r.body.versions[0].tracks.map(t => t.group), ['drums', 'keys', 'drums', 'drums', 'drums', 'drums', 'other']);
+      // a silent file is flagged and starts as "not used"; auto version numbers: a new track is a minor version, a rename a patch
+      { const sil = path.join(data, 'sil.wav'); spawnSync('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=mono', '-t', '1', sil]);
+        r = await A('POST', '/api/sessions', { name: 'Auto' }); const aid = r.body.id;
+        await A('PUT', `/api/sessions/${aid}/upload?name=Lead Vox.wav`, tone(300, 48000, 1)); await A('PUT', `/api/sessions/${aid}/upload?name=Empty.wav`, fs.readFileSync(sil));
+        let a = await untilReady(A, aid); assert.deepStrictEqual(a.draft.tracks.map(t => [t.group, t.silent, t.kind]), [['vocals', false, 'channel'], ['other', true, 'off']]);
+        r = await A('POST', `/api/sessions/${aid}/versions`, { bump: 'auto' }); assert.strictEqual(r.body.version, '1.0.0');
+        await A('PATCH', `/api/sessions/${aid}/draft/tracks/${a.draft.tracks[0].id}`, { name: 'BGV 1' });
+        a = (await A('GET', '/api/sessions/' + aid)).body; assert.strictEqual(a.draft.tracks[0].group, 'vocals');
+        await A('PATCH', `/api/sessions/${aid}/draft/tracks/${a.draft.tracks[0].id}`, { group: 'keys' });
+        r = await A('POST', `/api/sessions/${aid}/versions`, { bump: 'auto' }); assert.strictEqual(r.body.version, '1.0.1', 'rename + regroup is a patch');
+        await A('PUT', `/api/sessions/${aid}/upload?name=Bass.wav`, tone(55, 48000, 1)); await untilReady(A, aid);
+        r = await A('POST', `/api/sessions/${aid}/versions`, { bump: 'auto' }); assert.strictEqual(r.body.version, '1.1.0', 'a new track is a minor version');
+        await A('DELETE', '/api/sessions/' + aid); }
       // a dropped folder: upload everything, then "finish" saves 1.0.0 once converted; a hand-set date is kept
       r = await A('POST', '/api/sessions', { name: 'Dropped', source: 'daw' }); const did = r.body.id;
       await A('PUT', `/api/sessions/${did}/upload?name=a.wav&date=2024-05-05`, tone(100, 48000, 1));
@@ -102,9 +116,18 @@ async function untilReady(A, sid) { for (let i = 0; i < 200; i++) { const s = (a
       // LiveVault API v1 for LiveWebMixer, with the trainee's personal access token
       assert.strictEqual((await T('POST', `/api/sessions/${sid}/open`, {})).status, 400, 'needs the LiveWebMixer address');
       await A('PUT', '/api/settings', { lwmUrl: 'https://mixer.local:9443' });
-      r = await T('POST', `/api/sessions/${sid}/open`, { version: '1.0.1' }); assert.strictEqual(r.body.url, `https://mixer.local:9443/#vault=${sid}&version=1.0.1`);
+      r = await T('POST', `/api/sessions/${sid}/open`, { version: '1.0.1' });
+      { // the link connects LiveWebMixer as the person who clicked: it carries LiveVault's address and a fresh personal token
+        const u = new URL(r.body.url), hp = new URLSearchParams(u.hash.slice(1));
+        assert.strictEqual(u.origin, 'https://mixer.local:9443'); assert.strictEqual(hp.get('vault'), sid); assert.strictEqual(hp.get('version'), '1.0.1'); assert.strictEqual(hp.get('lv'), base);
+        const info = await (await fetch(base + '/api/v1/info', { headers: { Authorization: 'Bearer ' + hp.get('token') } })).json(); assert.strictEqual(info.user, 'Trainee');
+        const r2 = await T('POST', `/api/sessions/${sid}/open`, { version: '1.0.1' }), t2 = new URLSearchParams(new URL(r2.body.url).hash.slice(1)).get('token');
+        assert.strictEqual((await fetch(base + '/api/v1/info', { headers: { Authorization: 'Bearer ' + hp.get('token') } })).status, 401, 'the previous link token is replaced');
+        assert.strictEqual((await fetch(base + '/api/v1/info', { headers: { Authorization: 'Bearer ' + t2 } })).status, 200);
+        assert.strictEqual((await T('GET', '/api/me/tokens')).body.tokens.length, 1);
+      }
       r = await T('POST', '/api/me/tokens', { name: 'Mixer' }); const tok = r.body.token; assert.ok(/^lv_[a-f0-9]{48}$/.test(tok));
-      assert.strictEqual((await T('GET', '/api/me/tokens')).body.tokens.length, 1);
+      assert.strictEqual((await T('GET', '/api/me/tokens')).body.tokens.length, 2);
       const L = (m, u, b, ct) => fetch(base + u, { method: m, headers: { Authorization: 'Bearer ' + tok, ...(ct ? { 'Content-Type': ct } : {}) }, body: b });
       assert.strictEqual((await fetch(base + '/api/v1/info', { headers: { Authorization: 'Bearer lv_' + 'f'.repeat(48) } })).status, 401);
       const info = await (await L('GET', '/api/v1/info')).json(); assert.strictEqual(info.name, 'LiveVault'); assert.strictEqual(info.api, 1);
@@ -150,7 +173,7 @@ async function untilReady(A, sid) { for (let i = 0; i < 200; i++) { const s = (a
       let ws;
       for (let i = 0; i < 100; i++) { ws = (await A('GET', '/api/sessions')).body.sessions.find(x => x.name === 'Sunday 11-09'); if (ws && ws.version) break; await sleep(150); }
       assert.ok(ws && ws.version === '1.0.0', 'watch import saved a version');
-      assert.ok(/^\d{4}-\d{2}-\d{2}$/.test(ws.recorded), 'watch import has a date'); assert.strictEqual(ws.source, 'sq5'); assert.strictEqual(ws.tracks, 2);
+      assert.ok(/^\d{4}-\d{2}-\d{2}$/.test(ws.recorded), 'watch import has a date'); assert.strictEqual(ws.source, 'service'); assert.strictEqual(ws.tracks, 2);
       for (let i = 0; i < 20 && fs.existsSync(wd); i++) await sleep(100);
       assert.ok(!fs.existsSync(wd) && fs.readdirSync(path.join(watch, '_imported')).length === 1, 'imported folder moved aside');
 
@@ -169,6 +192,26 @@ async function untilReady(A, sid) { for (let i = 0; i < 200; i++) { const s = (a
       await A('PATCH', '/api/sessions/' + sid, { name: 'Goodness of God (Bethel)' }); await sleep(1500);
       assert.ok(!fs.existsSync(sdir) && fs.existsSync(path.join(lib, 'Goodness of God (Bethel) (2025-12-24)', 'v2.0.0')), 'folder follows a rename');
       r = await A('GET', '/api/storage'); assert.ok(r.body.audio > 0); assert.strictEqual(r.body.library.path, lib);
+
+      // import from the master folder (mounted read-only at /import), organized differently in different places
+      for (const [f, hz] of [['Band A/Song 1/Stems/Kick.wav', 60], ['Band A/Song 1/Stems/Bass.wav', 55], ['Band A/Song 1/Click/Click.wav', 1000], ['Song 2/Vox.wav', 400], ['Band B/Song 3/Gtr.wav', 200]]) {
+        fs.mkdirSync(path.dirname(path.join(imp, f)), { recursive: true }); fs.writeFileSync(path.join(imp, f), tone(hz, 48000, 1)); }
+      assert.strictEqual((await A('GET', '/api/state')).body.import, true);
+      r = await A('GET', '/api/import/browse?path='); assert.deepStrictEqual(r.body.folders.map(f => f.name), ['Band A', 'Band B', 'Song 2']);
+      assert.strictEqual((await A('GET', '/api/import/browse?path=../..')).status, 400, 'cannot leave the import folder');
+      r = await A('GET', '/api/import/plan?path=&mode=auto');
+      assert.deepStrictEqual(r.body.sessions.map(x => [x.name, x.band, x.files]), [['Song 1', 'Band A', 3], ['Song 3', 'Band B', 1], ['Song 2', '', 1]]);
+      r = await A('GET', '/api/import/plan?path=&mode=folder'); assert.deepStrictEqual(r.body.sessions.map(x => x.name), ['Click', 'Stems', 'Song 3', 'Song 2']);
+      r = await A('GET', '/api/import/plan?path=Band%20A&mode=auto'); assert.deepStrictEqual(r.body.sessions.map(x => [x.name, x.band]), [['Song 1', '']]);
+      assert.strictEqual((await T('POST', '/api/import/run', {})).status, 401);
+      r = await A('POST', '/api/import/run', { path: '', mode: 'auto', type: 'purchased', items: [{ folder: 'Band A/Song 1', name: 'Song One', band: 'Band A' }, { folder: 'Song 2', name: 'Song 2', band: '' }] }); assert.strictEqual(r.status, 200);
+      let js; for (let i = 0; i < 150; i++) { js = (await A('GET', '/api/import/status')).body; if (!js.job.running && !js.busy) break; await sleep(150); }
+      assert.deepStrictEqual(js.job.errors, []); assert.strictEqual(js.job.files, 4);
+      let made; for (let i = 0; i < 50; i++) { made = (await A('GET', '/api/sessions')).body.sessions.filter(x => ['Song One', 'Song 2'].includes(x.name)); if (made.every(x => x.version)) break; await sleep(150); }
+      assert.deepStrictEqual(made.map(x => [x.name, x.artist, x.source, x.version, x.tracks]).sort(), [['Song 2', '', 'purchased', '1.0.0', 1], ['Song One', 'Band A', 'purchased', '1.0.0', 3]]);
+      r = await A('GET', '/api/import/plan?path=&mode=auto'); assert.deepStrictEqual(r.body.sessions.map(x => x.imported), [true, false, true], 'already imported folders are marked');
+      assert.ok(fs.existsSync(path.join(imp, 'Song 2', 'Vox.wav')), 'the master folder is left alone');
+      for (const x of made) await A('DELETE', '/api/sessions/' + x.id);
       r = await A('POST', '/api/storage/cleanup'); assert.strictEqual(r.status, 200);
       assert.strictEqual((await A('GET', `/api/sessions/${sid}/files/${h}`)).status, 200, 'cleanup keeps audio that versions use');
     } else console.log('ffmpeg not installed here: skipped the audio tests');

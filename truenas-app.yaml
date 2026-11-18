@@ -18,6 +18,8 @@ services:
       # the audio library: a dataset you can browse over SMB (one readable folder per session).
       # Replace the left side with your dataset's path, and give user ID 1000 Modify permission on it.
       - /mnt/tank/LiveVault Library:/library
+      # your master folder of multitracks, read-only: Library > Import > From the master folder
+      - /mnt/tank/Multitracks:/import:ro
       # optional watch folder: share a dataset over SMB and mount it here, for example
       # - /mnt/tank/shares/LiveVault Inbox:/watch
     environment:
