@@ -46,7 +46,7 @@ async function render() {
   if (!S.user) { player.stop(); recPlayer.stop(); $('#nav').classList.add('hide'); $('#meBtn').classList.add('hide'); return fill(main, loginPage()); }
   renderNav();
   const r = route();
-  if (r.page !== 's') { player.stop(); recPlayer.stop(); main.dataset.sid = ''; }
+  if (r.page !== 's') { player.stop(); recPlayer.stop(); listenEl.pause(); main.dataset.sid = ''; }
   if (r.page !== 'me') newTok = '';
   try {
     if (r.page === 's' && r.a) return await sessionPage(main, r.a, r.b ? decodeURIComponent(r.b) : null);
@@ -103,9 +103,9 @@ const canAdd = () => S.user.admin || S.user.perms.upload;
 const canMix = () => S.st && S.st.lwm && (S.user.admin || S.user.perms.mix);
 
 // Open a session version in LiveWebMixer (a new tab, connected as you, straight into the mixer).
-async function openInMixer(sid, version) {
+async function openInMixer(sid, version, section) {
   const w = window.open('', '_blank');
-  try { const j = await api('POST', `/api/sessions/${sid}/open`, { version }); if (w) w.location = j.url; else location.href = j.url; }
+  try { const j = await api('POST', `/api/sessions/${sid}/open`, { version, section }); if (w) w.location = j.url; else location.href = j.url; }
   catch (e) { if (w) w.close(); S.msg = e.message; render(); }
 }
 function mixButton(sid, version, ready, big) {
@@ -156,7 +156,7 @@ async function libraryPage(main) {
             h('td', {}, h('span', { class: 'chip' }, TYPE[s.source] || s.source)),
             h('td', { class: 'num' }, s.recorded ? fmtDay(s.recorded) : '–'),
             h('td', { class: 'num' }, s.version ? 'v' + s.version : '–', s.draft && h('span', { class: 'chip warn', style: 'margin-left:6px', title: 'Has unsaved changes' }, 'Draft')),
-            h('td', { class: 'num' }, String(s.tracks)), h('td', { class: 'num' }, fmtTime(s.duration)),
+            h('td', { class: 'num' }, String(s.tracks)), h('td', { class: 'num' }, fmtTime(s.duration), s.sections ? h('div', { class: 'note' }, `${s.sections} song${s.sections === 1 ? '' : 's'}`) : null),
             h('td', {}, h('div', { class: 'chips' }, s.difficulty && h('span', { class: 'chip teal' }, DIFF[s.difficulty]), s.restricted && h('span', { class: 'chip warn', title: 'License-restricted' }, 'Licensed'))),
             h('td', { style: 'text-align:right' }, mixButton(s.id, s.version, s.ready))))))))));
   // drop folders anywhere on the library to import them
@@ -350,7 +350,7 @@ async function sessionPage(main, sid, view) {
           latest && mixButton(sid, (old || latest).v, s.ready[(old || latest).v], true),
           menuButton([s.can.delete && ['Delete session…', () => confirm(`Delete "${s.name}" with all its versions, mixes and recordings?`) && act(async () => { await api('DELETE', '/api/sessions/' + sid); S.s = null; go('#/'); }, false)]])),
         tracksSection(s, tracks, editable, old, latest)),
-      versionsCard(s, old ? old.v : latest && latest.v), mixesCard(s), recordingsCard(s))));
+      !old && sectionsCard(s, latest), versionsCard(s, old ? old.v : latest && latest.v), mixesCard(s), recordingsCard(s))));
   player.draw();
 }
 // a small "⋯" menu: items are [label, onclick] (falsy items are skipped)
@@ -560,6 +560,94 @@ function changesText(c) {
   return p.join('. ');
 }
 
+// ---- songs within a long recording: mark them on the waveform; each opens in LiveWebMixer on its own ----
+// All songs of a recording share its one master mix in LiveWebMixer.
+const parseTime = v => { const p = String(v).trim().split(':').map(Number); if (p.some(isNaN)) return NaN; return p.reduce((a, x) => a * 60 + x, 0); };
+const listenEl = new Audio(); listenEl.preload = 'none';
+function sectionsCard(s, latest) {
+  if (!latest) return null;
+  const ts = latest.tracks.filter(t => t.kind !== 'off' && t.hash), dur = Math.max(0, ...ts.map(t => t.duration || 0)), secs = s.sections || [];
+  if (!secs.length && dur < 480) return null;
+  const canEdit = s.can.edit, sid = s.id, W = () => cv.clientWidth || 800;
+  if (!S.sec || S.sec.sid !== sid) S.sec = { sid, sel: null, listen: (ts.find(t => t.kind === 'reference') || ts.find(t => /\b(main|mix|lr|l ?r|stereo|board|2 ?mix|program)\b/i.test(t.name)) || ts[0] || {}).id };   // listen to a full mix when there is one
+  const st = S.sec, lt = ts.find(t => t.id === st.listen) || ts[0];
+  const src = lt ? `/media/preview/${lt.hash}?s=${sid}` : ''; if (lt && !listenEl.src.endsWith(src)) { listenEl.pause(); listenEl.src = src; }
+  const cv = h('canvas', { class: 'overview' }); cv.addEventListener('redraw', () => draw());
+  const x2t = x => Math.max(0, Math.min(dur, x / W() * dur)), t2x = t => t / dur * W();
+  let pk = null;
+  const draw = () => {
+    if (!cv.isConnected) return;
+    const dpr = devicePixelRatio || 1, w = cv.clientWidth, hh = cv.clientHeight; if (cv.width !== Math.round(w * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(hh * dpr); }
+    const g = cv.getContext('2d'), css = getComputedStyle(document.documentElement), X = t => t / dur * cv.width; g.clearRect(0, 0, cv.width, cv.height);
+    secs.forEach((x, i) => { g.fillStyle = i % 2 ? '#4c8dff22' : '#12a59422'; g.fillRect(X(x.start), 0, X(x.end) - X(x.start), cv.height); });
+    if (pk) { g.fillStyle = css.getPropertyValue('--dim'); for (let x = 0; x < cv.width; x++) { const v = Math.sqrt(pk[Math.floor(x / cv.width * pk.length)] / 100), y = Math.max(1, v * cv.height * 0.85); g.fillRect(x, (cv.height - y) / 2, 1, y); } }
+    g.font = `${11 * dpr}px system-ui`; secs.forEach((x, i) => { g.fillStyle = i % 2 ? '#4c8dff' : '#12a594'; g.fillRect(X(x.start), 0, Math.max(dpr, X(x.end) - X(x.start)), 3 * dpr); g.fillRect(X(x.start), 0, dpr, cv.height); g.fillStyle = css.getPropertyValue('--fg'); g.fillText(x.name, X(x.start) + 4 * dpr, 15 * dpr, Math.max(0, X(x.end) - X(x.start) - 6 * dpr)); });
+    if (st.sel) { g.fillStyle = '#ffc53d33'; g.fillRect(X(st.sel.start), 0, X(st.sel.end) - X(st.sel.start), cv.height); g.fillStyle = '#ffc53d'; g.fillRect(X(st.sel.start), 0, 2 * dpr, cv.height); g.fillRect(X(st.sel.end) - 2 * dpr, 0, 2 * dpr, cv.height); }
+    g.fillStyle = css.getPropertyValue('--fg'); g.fillRect(X(listenEl.currentTime || 0), 0, Math.max(1, dpr), cv.height);
+    tm.textContent = `${fmtTime(listenEl.currentTime)} / ${fmtTime(dur)}` + (st.sel ? ` · selected ${fmtTime(st.sel.start)}–${fmtTime(st.sel.end)} (${fmtTime(st.sel.end - st.sel.start)})` : '');
+  };
+  // waveform of the reference mix if there is one, else the loudest of all tracks at each point
+  const src2 = ts.find(t => t.kind === 'reference') ? [ts.find(t => t.kind === 'reference')] : ts;
+  Promise.all(src2.map(t => peaks(`/media/peaks/${t.hash}?s=${sid}`).then(p => ({ p, d: t.duration })))).then(list => {
+    const N = 2000; pk = new Array(N).fill(0);
+    for (const { p, d } of list) if (p) for (let i = 0; i < N; i++) { const tt = i / N * dur; if (tt < d) pk[i] = Math.max(pk[i], p.p[Math.min(p.p.length - 1, Math.floor(tt / d * p.p.length))]); }
+    draw();
+  });
+  // mouse: drag on the waveform to select a song, drag a song's edge to move it, click to listen from there
+  let drag = null;
+  cv.onpointerdown = e => {
+    const r = cv.getBoundingClientRect(), x = e.clientX - r.left, t = x2t(x); cv.setPointerCapture(e.pointerId);
+    const edge = st.sel && (Math.abs(t2x(st.sel.start) - x) < 7 ? 'start' : Math.abs(t2x(st.sel.end) - x) < 7 ? 'end' : null);
+    drag = edge ? { edge } : { from: t, x, moved: false };
+  };
+  cv.onpointermove = e => {
+    const r = cv.getBoundingClientRect(), x = e.clientX - r.left, t = x2t(x);
+    cv.style.cursor = st.sel && (Math.abs(t2x(st.sel.start) - x) < 7 || Math.abs(t2x(st.sel.end) - x) < 7) ? 'ew-resize' : 'crosshair';
+    if (!drag || !canEdit) return;
+    if (drag.edge) { st.sel[drag.edge] = t; if (st.sel.end < st.sel.start) [st.sel.start, st.sel.end, drag.edge] = [st.sel.end, st.sel.start, drag.edge === 'start' ? 'end' : 'start']; draw(); return; }
+    if (Math.abs(x - drag.x) > 4) { drag.moved = true; st.sel = { start: Math.min(drag.from, t), end: Math.max(drag.from, t), id: null, name: st.sel && !st.sel.id ? st.sel.name : '' }; draw(); }
+  };
+  cv.onpointerup = e => {
+    const r = cv.getBoundingClientRect(), t = x2t(e.clientX - r.left), d = drag; drag = null;
+    if (d && !d.edge && !d.moved) {   // a click: select the song under it (or clear), and listen from there
+      const hit = secs.find(x => t >= x.start && t <= x.end); st.sel = hit ? { ...hit } : (st.sel && !st.sel.id && t >= st.sel.start && t <= st.sel.end ? st.sel : null);
+      listenEl.currentTime = t; render(); return;
+    }
+    if (d) render();
+  };
+  listenEl.ontimeupdate = draw; listenEl.onplay = listenEl.onpause = () => { const b = $('#lsPlay'); if (b) b.textContent = listenEl.paused ? '▶ Listen' : '❚❚ Pause'; };
+  const tm = h('span', { class: 'note', style: 'font-variant-numeric:tabular-nums' });
+  const save = list => act(async () => { S.s = await api('PATCH', '/api/sessions/' + sid, { sections: list }); });
+  // the editor for the selection
+  let form = null;
+  if (st.sel && canEdit) {
+    const nm = h('input', { type: 'text', class: 'grow', placeholder: 'Song name', value: st.sel.name || '' }), a = h('input', { type: 'text', value: fmtTime(st.sel.start), style: 'width:80px' }), b = h('input', { type: 'text', value: fmtTime(st.sel.end), style: 'width:80px' });
+    nm.oninput = () => { st.sel.name = nm.value; };
+    const sync = () => { const x = parseTime(a.value), y = parseTime(b.value); if (isFinite(x) && isFinite(y) && y > x) { st.sel.start = x; st.sel.end = y; draw(); } };
+    a.onchange = b.onchange = sync;
+    const ok = () => { sync(); if (!nm.value.trim()) { nm.focus(); return; } const item = { id: st.sel.id, name: nm.value.trim(), start: st.sel.start, end: st.sel.end }; const list = st.sel.id ? secs.map(x => x.id === st.sel.id ? item : x) : [...secs, item]; st.sel = null; save(list); };
+    nm.onkeydown = e => { if (e.key === 'Enter') ok(); };
+    form = h('div', { class: 'draft', style: 'margin-top:8px' }, h('div', { class: 'row' }, nm, h('span', { class: 'note' }, 'from'), a, h('span', { class: 'note' }, 'to'), b,
+      h('button', { class: 'on', onclick: ok }, st.sel.id ? 'Save song' : 'Add song'),
+      h('button', { onclick: () => { listenEl.currentTime = st.sel.start; listenEl.play(); } }, '▶ From start'),
+      st.sel.id && h('button', { class: 'danger', onclick: () => { const x = st.sel.id; st.sel = null; save(secs.filter(z => z.id !== x)); } }, 'Delete'),
+      h('button', { onclick: () => { st.sel = null; render(); } }, 'Cancel')));
+  }
+  const pick = h('select', { class: 'sm', onchange: () => { st.listen = pick.value; render(); } }, ts.map(t => h('option', { value: t.id, selected: lt && t.id === lt.id }, (t.kind === 'reference' ? 'REF ' : '') + t.name)));
+  const card = h('div', { class: 'card' }, h('h2', {}, `Songs in this recording · ${secs.length}`),
+    h('div', { class: 'note', style: 'margin-bottom:8px' }, canEdit ? 'Listen, then drag across the waveform to mark a song (drag its yellow edges to fine-tune). Each song opens in LiveWebMixer on its own, and all of them share this recording\'s master mix.' : 'Each song opens in LiveWebMixer on its own; they share this recording\'s master mix.'),
+    h('div', { class: 'row', style: 'margin-bottom:6px' }, h('button', { class: 'sm on', id: 'lsPlay', onclick: () => listenEl.paused ? listenEl.play() : listenEl.pause() }, listenEl.paused ? '▶ Listen' : '❚❚ Pause'), h('span', { class: 'note' }, 'to'), pick, tm),
+    cv, form,
+    secs.length ? h('div', { style: 'margin-top:8px' }, secs.map((x, i) => h('div', { class: 'li click' + (st.sel && st.sel.id === x.id ? ' on' : ''), style: 'cursor:pointer', onclick: () => { st.sel = { ...x }; listenEl.currentTime = x.start; render(); } },
+      h('span', { class: 'chip', style: `background:${i % 2 ? '#4c8dff33' : '#12a59433'}` }, String(i + 1)), h('b', { class: 'grow' }, x.name),
+      h('span', { class: 'note', style: 'font-variant-numeric:tabular-nums' }, `${fmtTime(x.start)}–${fmtTime(x.end)} · ${fmtTime(x.end - x.start)}`),
+      h('button', { class: 'sm', title: 'Listen from the start of this song', onclick: e => { e.stopPropagation(); listenEl.currentTime = x.start; listenEl.play(); } }, '▶'),
+      canMix() && h('button', { class: 'sm on', title: 'Open just this song in LiveWebMixer', onclick: e => { e.stopPropagation(); openInMixer(sid, latest.v, x.id); } }, 'Mix ▸')))) : null);
+  requestAnimationFrame(draw);
+  return card;
+}
+window.addEventListener('resize', () => { const c = document.querySelector('canvas.overview'); if (c) c.dispatchEvent(new Event('redraw')); });
+
 // ---- versions ----
 function versionsCard(s, shown) {
   if (!s.versions.length) return null;
@@ -602,7 +690,7 @@ function recordingsCard(s) {
             (r.by === S.user.id || S.user.admin) && ['Rename…', () => { const n = prompt('Recording name', r.name); n && act(async () => { await api('PATCH', `/api/sessions/${sid}/recordings/${r.id}`, { name: n }); await loadSession(sid); }); }],
             (s.can.download || r.by === S.user.id) && ['Download WAV', () => { location.href = `/api/sessions/${sid}/recordings/${r.id}/download`; }],
             (r.by === S.user.id || s.can.delete) && ['Delete', () => confirm(`Delete the recording "${r.name}"?`) && act(async () => { recPlayer.stop(); await api('DELETE', `/api/sessions/${sid}/recordings/${r.id}`); await loadSession(sid); }), 'danger']])),
-        h('div', { class: 'note' }, `${r.byName} · v${r.version}${r.mixName ? ' · mix "' + r.mixName + '"' : ''} · ${fmtWhen(r.created)} · ${fmtTime(r.duration)}${r.start ? ' · starts at ' + fmtTime(r.start) + ' in the song' : ''}`),
+        h('div', { class: 'note' }, `${r.byName} · v${r.version}${r.section ? ' · ' + r.section : ''}${r.mixName ? ' · mix "' + r.mixName + '"' : ''} · ${fmtWhen(r.created)} · ${fmtTime(r.duration)}${r.start ? ' · starts at ' + fmtTime(r.start) + ' in the song' : ''}`),
         recPlayer.ui(sid, r, ref),
         notes || (r.notes ? h('div', { class: 'review' }, r.notes) : null),
         r.notesAt && h('div', { class: 'note', style: 'margin-top:4px' }, `Review by ${r.notesByName} · ${fmtWhen(r.notesAt)}`));
@@ -669,6 +757,8 @@ const player = {
   seek(sec) { const was = this.playing; this.pause(); this.off = Math.max(0, Math.min(this.dur, sec)); if (was) this.play(); else this.draw(); },
   transport(tracks) {
     const listen = tracks.filter(t => t.kind !== 'off'); if (!listen.length || listen.some(t => !t.hash || (t.status && t.status !== 'ready'))) return null;
+    const mem = listen.reduce((n, t) => n + t.duration * 48000 * 4 * (t.channels > 1 ? 2 : 1), 0);
+    if (mem > 1.5e9) return h('span', { class: 'note' }, `Too long to preview every track at once (it would need ${fmtMB(mem)} of memory). Use the song finder below to listen and mark songs.`);
     const hasRef = tracks.some(t => t.kind === 'reference');
     const play = h('button', { class: 'on', style: 'min-width:120px', onclick: () => this.playing ? this.pause() : this.play() });
     const time = h('span', { class: 'time' }), seek = h('input', { type: 'range', class: 'seek', min: 0, max: Math.max(1, this.dur), step: 0.05, value: this.off });

@@ -151,3 +151,6 @@ table.lib td:last-child { width:1%; }
 .trk.off { opacity:.45; } .trk.odd canvas.wave { outline:1px solid var(--warn); }
 .trk.dragging { opacity:.4; } .trk.drop-before { box-shadow:inset 3px 0 0 var(--g), inset 0 2px 0 var(--acc); } .trk.drop-after { box-shadow:inset 3px 0 0 var(--g), inset 0 -2px 0 var(--acc); }
 @media (max-width:700px) { .trk { grid-template-columns:14px 26px 1fr auto auto; } .trk canvas.wave, .trk .wave-wrap { display:none; } }
+canvas.overview { display:block; width:100%; height:90px; background:var(--inset); border-radius:8px; cursor:crosshair; touch-action:none; }
+.li.on { background:var(--card2); }
+.li { display:flex; gap:8px; align-items:center; padding:6px 0; border-top:1px solid var(--line); }
